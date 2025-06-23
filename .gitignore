@@ -1,0 +1,10 @@
+venv/
+screenshots/
+inspect/
+dev/
+batch_config.ini
+dfe_mapping_config.ini
+dfe_parameter_config.ini
+ext_report_config.ini
+__pycache__/
+*.pyc
