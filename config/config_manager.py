@@ -1,10 +1,10 @@
 import configparser
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 @dataclass
 class AppConfig:
-    """Stores and manages application configuration settings"""
+    """Stores and manages application configuration settings."""
     mode: str
     url: str
     username: str
@@ -15,14 +15,16 @@ class AppConfig:
     headless: bool
     browser_choice: str = ""
     file_path: str = ""
-    # ? batch_version: str = "sbii"
+    # The specific version of the batch process to run (e.g., "sbii", "jamkrindo").
+    batch_jobs: List[Tuple[str, List[str]]] = field(default_factory=list)
     batch_version: Optional[str] = None
+    # Holds data for dynamic form fields, mapping table names to field lists.
     extractors: Dict[str, List[str]] = field(default_factory=dict)
     tables: List[str] = field(default_factory=list)
 
     @classmethod
     def from_config_file(cls, config_path: str, mode: str):
-        """Initialize configuration from INI file"""
+        """Initialize configuration from INI file."""
         config = configparser.ConfigParser()
         config.read(config_path)
         

@@ -7,16 +7,16 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 
 class CommitHandler:
-    """Handles form commit operations"""
+    """Handles form commit operations."""
     
     def __init__(self, driver, wait):
         self.driver = driver
         self.wait = wait
     
     def execute_commit(self) -> bool:
-        """Execute form commit action"""
+        """Execute form commit action."""
         try:
-            # Locate commit button using multiple identifiers
+            # Locate the commit button using multiple possible identifiers for robustness.
             commit_button = self.wait.until(
                 EC.element_to_be_clickable((
                     By.XPATH,
@@ -24,7 +24,7 @@ class CommitHandler:
                     "//a[contains(@href,'doToolbar')]/img[contains(@src,'txncommit.gif')]"
                 )))
             
-            # Scroll into view and click
+            # Scroll the button into view and click it.
             self.driver.execute_script(
                 "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
                 commit_button)
@@ -32,7 +32,7 @@ class CommitHandler:
             commit_button.click()
             Logger.info("Commit executed")
 
-            # Verify successful commit
+            # Define possible success messages to confirm the transaction is complete.
             confirmation_xpath = "//*[contains(text(), 'Txn Complete') or contains(text(), 'Transaction Complete') or contains(text(), 'LIVE RECORD NOT CHANGED')]"
             confirmation_element = self.wait.until(EC.presence_of_element_located((By.XPATH, confirmation_xpath)))
             Logger.success(f"Transaction confirmed: '{confirmation_element.text}'")

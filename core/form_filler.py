@@ -5,15 +5,11 @@ from config.config_manager import AppConfig
 
 import time
 
-from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from typing import Optional, Set
+from typing import List, Optional, Set
 
 class BaseBatchFormFiller:
     """Base class for filling batch processing forms with common logic."""
@@ -24,34 +20,61 @@ class BaseBatchFormFiller:
         self.utils = utils
         self.config = config
         self.batch_file_path = config.file_path
+        self._form_cache = None # Caches the form structure to avoid re-scanning.
 
     def _get_initial_data_value(self) -> str:
-        """Returns the specific data value for the first FDS.COB.FLAG job (e.g., 'JEACS', 'SEACS')."""
+        """Returns the specific data value for the first, static job (e.g., 'JEACS')."""
         raise NotImplementedError
 
     def _get_first_extractor_verification(self) -> Optional[str]:
-        """Returns the verification value for the first EB.EXTRACTOR job. Returns None if not needed."""
+        """Returns the verification value for the first dynamically added EB.EXTRACTOR job."""
         raise NotImplementedError
     
     def _add_final_mandatory_rows(self, state: dict) -> bool:
-        """Adds the specific sequence of mandatory rows at the end of the form."""
+        """Adds the specific sequence of mandatory jobs at the end of the form."""
         raise NotImplementedError
 
-    def _scan_form_for_all_tables(self) -> dict:
-        """Scan form to detect existing table configurations"""
+    def _fill_field_direct(self, name: str, value: str) -> bool:
+        """A faster, non-recursive method to fill a field by its name."""
+        try:
+            field = self.driver.find_element(By.NAME, name)
+            field.clear()
+            field.send_keys(value)
+            return True
+        except Exception as e:
+            Logger.error(f"Direct field fill error '{name}': {e}")
+            return False
+
+    def _scan_form_for_all_tables(self, use_cache=True) -> dict:
+        """Scans the form to detect existing job configurations."""
+        if use_cache and self._form_cache is not None:
+            Logger.debug("[CACHE] Using cached form structure.")
+            return self._form_cache
+
         Logger.info("Scanning form structure...")
         state = {
-            "main_tables": {}, 
-            "concat_tables": {}, 
+            "main_tables": {},
+            "concat_tables": {},
             "concat_row_index": 0,
-            "last_sub_value_index": 0, 
+            "last_sub_value_index": 0,
             "all_tables": set(),
         }
-
-        all_job_fields = self.utils.find_elements_recursive(By.XPATH, "//input[starts-with(@name, 'fieldName:JOB.NAME:')]")
-        all_data_fields = self.utils.find_elements_recursive(By.XPATH, "//input[starts-with(@name, 'fieldName:DATA:')]")
-        job_name_map = {int(f.get_attribute("name").split(":")[-1]): f.get_attribute("value") for f in all_job_fields}
         
+        try:
+            concat_input_xpath = "//span[normalize-space(text())='FDS.CBR.CONCAT.FILE.MT']/ancestor::tr[1]//input[starts-with(@name, 'fieldName:JOB.NAME:')]"
+            concat_input_element = self.utils.find_element_recursive(By.XPATH, concat_input_xpath)
+            if concat_input_element:
+                name_attr = concat_input_element.get_attribute("name")
+                row_index = int(name_attr.split(':')[-1])
+                state["concat_row_index"] = row_index
+                Logger.debug(f"CONCAT row explicitly found at index: {row_index} via its text label.")
+        except Exception:
+            Logger.debug("Could not find CONCAT row via text label, will rely on input value scan.")
+
+        all_job_fields = self.driver.find_elements(By.XPATH, "//input[starts-with(@name, 'fieldName:JOB.NAME:')]")
+        all_data_fields = self.driver.find_elements(By.XPATH, "//input[starts-with(@name, 'fieldName:DATA:')]")
+        job_name_map = {int(f.get_attribute("name").split(":")[-1]): f.get_attribute("value") for f in all_job_fields}
+
         data_map = {}
         for f in all_data_fields:
             try:
@@ -65,82 +88,56 @@ class BaseBatchFormFiller:
 
         for row_index, job_name in job_name_map.items():
             if job_name == "FDS.CBR.CONCAT.FILE.MT":
-                state["concat_row_index"] = row_index
+                if state["concat_row_index"] == 0:
+                    state["concat_row_index"] = row_index
                 if row_index in data_map:
                     state["last_sub_value_index"] = len(data_map[row_index])
                     for val in [v for v in data_map[row_index] if v]:
                         state["concat_tables"][val] = row_index
                         state["all_tables"].add(val)
-            elif job_name: 
+            elif job_name:
                 if row_index in data_map and data_map[row_index]:
                     val = data_map[row_index][0]
                     if val:
                         state["main_tables"][val] = row_index
                         state["all_tables"].add(val)
 
-        Logger.info(f"Found {len(state['main_tables'])} main table, {len(state['concat_tables'])} concat tables")
+        Logger.info(f"Scan complete: Found {len(state['main_tables'])} main jobs, {len(state['concat_tables'])} concat tables.")
+        self._form_cache = state
         return state
 
     def _click_expand_on_row(self, row_index: int) -> bool:
-        """Expand multi-value row using JavaScript click"""
+        """Clicks the 'Expand Multi Value' button for a given row."""
         try:
             xpath = f"//input[@name='fieldName:JOB.NAME:{row_index}']/ancestor::tr[1]//img[contains(@title, 'Expand Multi Value')]"
-            expand_button = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+            expand_button = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
             self.driver.execute_script("arguments[0].click();", expand_button)
             
             new_row_index = row_index + 1
             self.wait.until(EC.presence_of_element_located((By.NAME, f"fieldName:JOB.NAME:{new_row_index}")))
             return True
         except Exception as e:
-            Logger.error(f"Expand click failed: {e}")
+            Logger.error(f"Expand click failed on row {row_index}: {e}")
             return False
 
     def _click_sub_value_expand_button(self, row_index: int, last_sub_value_index: int) -> bool:
-        """Expand sub-values in concat rows"""
+        """Expand sub-values in concat rows using a faster JS click."""
         try:
-            possible_xpaths = [
-                f"//input[@name='fieldName:DATA:{row_index}:{last_sub_value_index}']/ancestor::tr[1]//img[@title='Expand Sub Value']",
-                f"//input[@name='fieldName:DATA:{row_index}:{last_sub_value_index}']/parent::td/following-sibling::td//img[@title='Expand Sub Value']",
-                f"//input[@name='fieldName:DATA:{row_index + 1}:{last_sub_value_index}']/ancestor::tr[1]//img[@title='Expand Sub Value']",
-                f"//input[@name='fieldName:DATA:{row_index + 1}:{last_sub_value_index}']/parent::td/following-sibling::td//img[@title='Expand Sub Value']",
-            ]
-
-            expand_button = None
-            xpath_found = None
-            for xpath in possible_xpaths:
-                expand_button = self.utils.find_element_recursive(By.XPATH, xpath)
-                if expand_button:
-                    xpath_found = xpath
-                    break
-
-            if not expand_button:
-                Logger.error("Expand Sub Value button not found")
-                self.utils.save_page_source(f"{self.config.inspect_dir}/expand_failed.html")
-                return False
-
-            self.driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", expand_button)
+            xpath = f"//input[@name='fieldName:DATA:{row_index}:{last_sub_value_index}']/ancestor::tr[1]//img[@title='Expand Sub Value']"
             
-            expand_link_xpath = f"({xpath_found})/ancestor::a[1]"
-            expand_link = self.utils.find_element_recursive(By.XPATH, expand_link_xpath)
+            expand_button = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            self.driver.execute_script("arguments[0].click();", expand_button)
             
-            if expand_link:
-                javascript_code = expand_link.get_attribute('href')
-                if javascript_code and javascript_code.startswith("javascript:"):
-                    js_to_execute = javascript_code.split("javascript:", 1)[1]
-                    self.driver.execute_script(js_to_execute)
-                else:
-                    expand_button.click()
-            else:
-                expand_button.click()
-
-            time.sleep(1.5)
+            new_sub_index = last_sub_value_index + 1
+            self.wait.until(EC.presence_of_element_located((By.NAME, f"fieldName:DATA:{row_index}:{new_sub_index}")))
             return True
         except Exception as e:
-            Logger.error(f"Expand sub-value failed: {e}")
+            Logger.error(f"Expand sub-value failed at row {row_index}, sub-index {last_sub_value_index}: {e}")
+            self.utils.save_page_source(f"{self.config.inspect_dir}/expand_sub_value_failed.html")
             return False
 
     def _fill_field_by_name(self, field_name: str, value: str) -> bool:
-        """Fill form field by name attribute"""
+        """A wrapper for finding and filling a field by its name attribute."""
         try:
             field = self.utils.wait_for_element(By.NAME, field_name, timeout=10)
             if not field:
@@ -151,12 +148,14 @@ class BaseBatchFormFiller:
             field.send_keys(value)
             return True
         except Exception as e:
-            Logger.error(f"Field fill failed: {field_name} - {e}")
+            Logger.error(f"Field fill failed for '{field_name}': {e}")
             return False
             
-    def _perform_initial_setup(self, state: dict) -> bool:
-        """Performs the initial setup if the form is empty."""
-        is_form_truly_empty = not state["main_tables"] and not state["concat_tables"]
+    def _perform_initial_setup(self, table_names_from_file: List[str]) -> bool:
+        """Performs the initial setup if the form is completely empty."""
+        initial_state = self._scan_form_for_all_tables(use_cache=False)
+        is_form_truly_empty = not initial_state["main_tables"] and not initial_state["concat_tables"]
+        
         if not is_form_truly_empty:
             return False
 
@@ -168,226 +167,122 @@ class BaseBatchFormFiller:
         if not self._fill_field_by_name("fieldName:FREQUENCY:1", "D"): return False
         if not self._fill_field_by_name("fieldName:DATA:1:1", initial_data_value): return False
         
-        state['main_tables'][initial_data_value] = 1
-        state['all_tables'].add(initial_data_value)
         Logger.success(f"Initial setup complete with data: {initial_data_value}")
         return True
 
-    def execute_filling_process(self) -> bool:
-        """Main batch form filling workflow"""
+    def _invalidate_form_cache(self):
+        """Clears the cached form structure to force a re-scan."""
+        self._form_cache = None
+    
+    def _update_concat_cache(self, table_name: str, concat_row_index: int):
+        """Updates the local cache after adding a table to the CONCAT row without a full re-scan."""
+        if self._form_cache:
+            self._form_cache["concat_tables"][table_name] = concat_row_index
+            self._form_cache["all_tables"].add(table_name)
+            self._form_cache["last_sub_value_index"] += 1
+
+    def execute_filling_process(self, table_names_from_file: List[str]) -> bool:
+        """The main, generic workflow for filling a batch form."""
         try:
-            Logger.info(f"Starting form filling process for version: {self.config.batch_version.upper()}")
+            Logger.info(f"Starting standard batch filling for version: {self.config.batch_version.upper()}")
             changes_made = False
-            table_names_from_file = DataManager.load_batch_tables(self.batch_file_path)
 
-            state = self._scan_form_for_all_tables()
-            changes_made = self._perform_initial_setup(state) or changes_made
-            
-            if changes_made:
-                state = self._scan_form_for_all_tables()
+            # Initial setup is now more complex and version-dependent, handled by subclasses
+            if self._perform_initial_setup(table_names_from_file):
+                self._invalidate_form_cache()
+                changes_made = True
 
-            Logger.info("Checking for missing EB.EXTRACTOR rows...")
-            missing_tables = [t for t in table_names_from_file if t not in state["main_tables"].keys()]
+            initial_state = self._scan_form_for_all_tables(use_cache=False)
+            missing_tables = [t for t in table_names_from_file if t not in initial_state.get("all_tables", set())]
 
             if missing_tables:
-                changes_made = True
-                Logger.info(f"Adding {len(missing_tables)} missing EB.EXTRACTOR job(s)...")
+                Logger.info(f"Found {len(missing_tables)} new jobs to add.")
                 
-                all_main_indices = list(state["main_tables"].values())
-                
-                # Mengubah 'idx' menjadi 'job' untuk menyimpan nomor baris (integer), bukan nama tabel (string).
-                extractor_indices = [job for idx, job in state["main_tables"].items() 
-                                     if self.driver.find_element(By.NAME, f"fieldName:JOB.NAME:{job}").get_attribute("value") == "EB.EXTRACTOR"]
-                
-                last_row_index = max(extractor_indices) if extractor_indices else (max(all_main_indices) if all_main_indices else 0)
-                Logger.info(f"Adding new jobs after row: {last_row_index}")
-                
+                all_job_inputs = self.utils.find_elements_recursive(By.XPATH, "//input[starts-with(@name, 'fieldName:JOB.NAME:')]")
+                last_row_index = 0
+                for job_input in all_job_inputs:
+                    job_name = job_input.get_attribute("value")
+                    current_row_index = int(job_input.get_attribute("name").split(":")[-1])
+                    if job_name in ("EB.EXTRACTOR", "FDS.COB.FLAG", ""):
+                        last_row_index = current_row_index
+                    else:
+                        break
+
+                has_existing_extractors = any(
+                    "EB.EXTRACTOR" in job_name for job_name in initial_state.get("main_tables", {}).keys()
+                )
+
                 for i, table_to_add in enumerate(missing_tables):
-                    Logger.info(f"Adding job for: {table_to_add}")
                     if not self._click_expand_on_row(last_row_index): return False
                     new_row_index = last_row_index + 1
-                    if not self.utils.wait_for_element(By.NAME, f"fieldName:JOB.NAME:{new_row_index}", 10): return False
-                    self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "EB.EXTRACTOR")
-                    
-                    verification_value = None
-                    if i == 0 and not extractor_indices: # First extractor to be added on a form without any existing extractors
-                        verification_value = self._get_first_extractor_verification()
-                    else: # Subsequent extractors
-                        verification_value = "EB.EXTRACTOR"
-                    
-                    if verification_value:
-                        self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", verification_value)
+                    self.wait.until(EC.presence_of_element_located((By.NAME, f"fieldName:JOB.NAME:{new_row_index}")))
 
+                    self._fill_field_direct(f"fieldName:JOB.NAME:{new_row_index}", "EB.EXTRACTOR")
+                    
+                    verification_value = "EB.EXTRACTOR"
+                    if i == 0 and not has_existing_extractors:
+                        v = self._get_first_extractor_verification()
+                        verification_value = v if v else verification_value
+                    self._fill_field_direct(f"fieldName:VERIFICATION:{new_row_index}:1", verification_value)
+                    
                     self.driver.execute_script(f"document.getElementsByName('fieldName:FREQUENCY:{new_row_index}')[0].value = 'D';")
-                    self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", table_to_add)
-                    
+                    self._fill_field_direct(f"fieldName:DATA:{new_row_index}:1", table_to_add)
                     last_row_index = new_row_index
-                    # Tidak perlu menambahkan ke extractor_indices lagi di dalam loop
+                    changes_made = True
 
-            Logger.info("Processing CONCAT row...")
-            final_state = self._scan_form_for_all_tables()
-            concat_row_index = final_state["concat_row_index"]
+            self._invalidate_form_cache()
+            final_state = self._scan_form_for_all_tables(use_cache=False)
+            concat_row_index = final_state.get("concat_row_index", 0)
 
-            if concat_row_index == 0:
-                if not final_state["main_tables"]:
-                    Logger.error("Cannot create CONCAT row without main jobs")
-                    return False
-                changes_made = True
-                Logger.info("Creating new CONCAT row")
-                # Menggunakan final_state untuk mendapatkan baris terakhir yang akurat
+            if concat_row_index == 0 and final_state.get("main_tables"):
                 last_main_row = max(final_state["main_tables"].values())
                 if not self._click_expand_on_row(last_main_row): return False
                 concat_row_index = last_main_row + 1
-                if not self.utils.wait_for_element(By.NAME, f"fieldName:JOB.NAME:{concat_row_index}", 10): return False
-                self._fill_field_by_name(f"fieldName:JOB.NAME:{concat_row_index}", "FDS.CBR.CONCAT.FILE.MT")
-                self._fill_field_by_name(f"fieldName:VERIFICATION:{concat_row_index}:1", "EB.EXTRACTOR")
+                self._fill_field_direct(f"fieldName:JOB.NAME:{concat_row_index}", "FDS.CBR.CONCAT.FILE.MT")
+                self._fill_field_direct(f"fieldName:VERIFICATION:{concat_row_index}:1", "EB.EXTRACTOR")
                 self.driver.execute_script(f"document.getElementsByName('fieldName:FREQUENCY:{concat_row_index}')[0].value = 'D';")
-                final_state = self._scan_form_for_all_tables()
-
-            missing_in_concat_list = [t for t in table_names_from_file if t not in final_state["concat_tables"].keys()]
-            if missing_in_concat_list:
+                self._invalidate_form_cache()
+                final_state = self._scan_form_for_all_tables(use_cache=False)
                 changes_made = True
-                Logger.info(f"Adding {len(missing_in_concat_list)} missing CONCAT entries...")
-                first_data_field_name = f"fieldName:DATA:{final_state['concat_row_index']}:1"
-                first_data_field = self.utils.find_element_recursive(By.NAME, first_data_field_name)
-                if first_data_field and not first_data_field.get_attribute("value"):
-                    table_to_fill_first = missing_in_concat_list.pop(0)
-                    Logger.info(f"Filling first data field with: {table_to_fill_first}")
-                    self._fill_field_by_name(first_data_field_name, table_to_fill_first)
-                    final_state = self._scan_form_for_all_tables()
 
-                if missing_in_concat_list:
-                    Logger.info(f"Adding {len(missing_in_concat_list)} remaining CONCAT entries...")
-                    current_sub_index = final_state["last_sub_value_index"]
-                    for table_name in missing_in_concat_list:
-                        if not self._click_sub_value_expand_button(final_state["concat_row_index"], current_sub_index): return False
-                        next_index = current_sub_index + 1
-                        new_field = self.utils.wait_for_element(By.NAME, f"fieldName:DATA:{final_state['concat_row_index']}:{next_index}", 5)
-                        if not new_field: new_field = self.utils.wait_for_element(By.NAME, f"fieldName:DATA:{final_state['concat_row_index'] + 1}:{next_index}", 5)
-                        if not new_field: return False
-                        self._fill_field_by_name(new_field.get_attribute("name"), table_name)
-                        current_sub_index = next_index
-            
-            changes_made = self._add_final_mandatory_rows(self._scan_form_for_all_tables()) or changes_made
-            
+            existing_tables_in_concat = final_state.get("concat_tables", {}).keys()
+            tables_to_add_to_concat = [t for t in table_names_from_file if t not in existing_tables_in_concat]
+
+            if tables_to_add_to_concat:
+                Logger.info(f"Adding {len(tables_to_add_to_concat)} tables to CONCAT job...")
+                current_sub_index = final_state.get("last_sub_value_index", 0)
+
+                first_field = self.driver.find_element(By.NAME, f"fieldName:DATA:{concat_row_index}:1")
+                if first_field and not first_field.get_attribute("value") and tables_to_add_to_concat:
+                    first_table = tables_to_add_to_concat.pop(0)
+                    self._fill_field_direct(f"fieldName:DATA:{concat_row_index}:1", first_table)
+                    self._update_concat_cache(first_table, concat_row_index)
+                    current_sub_index = 1
+                
+                for table_name in tables_to_add_to_concat:
+                    if not self._click_sub_value_expand_button(concat_row_index, current_sub_index): return False
+                    current_sub_index += 1
+                    field_name = f"fieldName:DATA:{concat_row_index}:{current_sub_index}"
+                    self.wait.until(EC.presence_of_element_located((By.NAME, field_name)))
+                    self._fill_field_direct(field_name, table_name)
+                    self._update_concat_cache(table_name, concat_row_index)
+                changes_made = True
+
+            self._invalidate_form_cache()
+            if self._add_final_mandatory_rows(self._scan_form_for_all_tables(use_cache=False)):
+                changes_made = True
+
             if not changes_made:
-                Logger.plain("All batch data already exist")
-            Logger.success("Form filling completed")
+                Logger.plain("No changes needed; all jobs already exist.")
+            else:
+                Logger.success("Form filling completed successfully.")
             return True
 
         except Exception as e:
-            Logger.error(f"Form processing error: {e}")
+            Logger.error(f"Batch form processing error: {e}", exc_info=True)
             self.utils.take_screenshot(f"{self.config.screenshot_dir}/form_error.png")
             return False
 
-    # def execute_filling_process(self) -> bool:
-    #     """Main batch form filling workflow"""
-    #     try:
-    #         Logger.info(f"Starting form filling process for version: {self.config.batch_version.upper()}")
-    #         changes_made = False
-    #         table_names_from_file = DataManager.load_batch_tables(self.batch_file_path)
-
-    #         state = self._scan_form_for_all_tables()
-    #         changes_made = self._perform_initial_setup(state) or changes_made
-            
-    #         # Re-scan state if initial setup was performed
-    #         if changes_made:
-    #             state = self._scan_form_for_all_tables()
-
-    #         Logger.info("Checking for missing EB.EXTRACTOR rows...")
-    #         missing_tables = [t for t in table_names_from_file if t not in state["main_tables"].keys()]
-
-    #         if missing_tables:
-    #             changes_made = True
-    #             Logger.info(f"Adding {len(missing_tables)} missing EB.EXTRACTOR job(s)...")
-                
-    #             all_main_indices = list(state["main_tables"].values())
-    #             extractor_indices = [idx for idx, job in state["main_tables"].items() 
-    #                                  if self.driver.find_element(By.NAME, f"fieldName:JOB.NAME:{job}").get_attribute("value") == "EB.EXTRACTOR"]
-    #             last_row_index = max(extractor_indices) if extractor_indices else (max(all_main_indices) if all_main_indices else 0)
-    #             Logger.info(f"Adding new jobs after row: {last_row_index}")
-                
-    #             for i, table_to_add in enumerate(missing_tables):
-    #                 Logger.info(f"Adding job for: {table_to_add}")
-    #                 if not self._click_expand_on_row(last_row_index): return False
-    #                 new_row_index = last_row_index + 1
-    #                 if not self.utils.wait_for_element(By.NAME, f"fieldName:JOB.NAME:{new_row_index}", 10): return False
-    #                 self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "EB.EXTRACTOR")
-                    
-    #                 verification_value = None
-    #                 if i == 0: # First extractor to be added
-    #                     verification_value = self._get_first_extractor_verification()
-    #                 else: # Subsequent extractors
-    #                     verification_value = "EB.EXTRACTOR"
-                    
-    #                 if verification_value:
-    #                     self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", verification_value)
-
-    #                 self.driver.execute_script(f"document.getElementsByName('fieldName:FREQUENCY:{new_row_index}')[0].value = 'D';")
-    #                 self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", table_to_add)
-                    
-    #                 last_row_index = new_row_index
-    #                 extractor_indices.append(new_row_index)
-
-    #         Logger.info("Processing CONCAT row...")
-    #         final_state = self._scan_form_for_all_tables()
-    #         concat_row_index = final_state["concat_row_index"]
-
-    #         if concat_row_index == 0:
-    #             if not final_state["main_tables"]:
-    #                 Logger.error("Cannot create CONCAT row without main jobs")
-    #                 return False
-    #             changes_made = True
-    #             Logger.info("Creating new CONCAT row")
-    #             last_main_row = max(final_state["main_tables"].values())
-    #             if not self._click_expand_on_row(last_main_row): return False
-    #             concat_row_index = last_main_row + 1
-    #             if not self.utils.wait_for_element(By.NAME, f"fieldName:JOB.NAME:{concat_row_index}", 10): return False
-    #             self._fill_field_by_name(f"fieldName:JOB.NAME:{concat_row_index}", "FDS.CBR.CONCAT.FILE.MT")
-    #             self._fill_field_by_name(f"fieldName:VERIFICATION:{concat_row_index}:1", "EB.EXTRACTOR")
-    #             self.driver.execute_script(f"document.getElementsByName('fieldName:FREQUENCY:{concat_row_index}')[0].value = 'D';")
-    #             final_state = self._scan_form_for_all_tables()
-
-    #         missing_in_concat_list = [t for t in table_names_from_file if t not in final_state["concat_tables"].keys()]
-    #         if missing_in_concat_list:
-    #             changes_made = True
-    #             Logger.info(f"Adding {len(missing_in_concat_list)} missing CONCAT entries...")
-    #             first_data_field_name = f"fieldName:DATA:{final_state['concat_row_index']}:1"
-    #             first_data_field = self.utils.find_element_recursive(By.NAME, first_data_field_name)
-    #             if first_data_field and not first_data_field.get_attribute("value"):
-    #                 table_to_fill_first = missing_in_concat_list.pop(0)
-    #                 Logger.info(f"Filling first data field with: {table_to_fill_first}")
-    #                 self._fill_field_by_name(first_data_field_name, table_to_fill_first)
-    #                 final_state = self._scan_form_for_all_tables()
-
-    #             if missing_in_concat_list:
-    #                 Logger.info(f"Adding {len(missing_in_concat_list)} remaining CONCAT entries...")
-    #                 current_sub_index = final_state["last_sub_value_index"]
-    #                 for table_name in missing_in_concat_list:
-    #                     if not self._click_sub_value_expand_button(final_state["concat_row_index"], current_sub_index): return False
-    #                     next_index = current_sub_index + 1
-    #                     new_field = self.utils.wait_for_element(By.NAME, f"fieldName:DATA:{final_state['concat_row_index']}:{next_index}", 5)
-    #                     if not new_field: new_field = self.utils.wait_for_element(By.NAME, f"fieldName:DATA:{final_state['concat_row_index'] + 1}:{next_index}", 5)
-    #                     if not new_field: return False
-    #                     self._fill_field_by_name(new_field.get_attribute("name"), table_name)
-    #                     current_sub_index = next_index
-            
-    #         # Add version-specific mandatory final rows
-    #         changes_made = self._add_final_mandatory_rows(self._scan_form_for_all_tables()) or changes_made
-            
-    #         if not changes_made:
-    #             Logger.plain("All batch data already exist")
-    #         Logger.success("Form filling completed")
-    #         return True
-
-    #     except Exception as e:
-    #         Logger.error(f"Form processing error: {e}")
-    #         self.utils.take_screenshot(f"{self.config.screenshot_dir}/form_error.png")
-    #         return False
-
-# ===================================================================
-# CLASS: BATCH Form Handler - SBII Version
-# ===================================================================
 class BatchFormFiller_SBII(BaseBatchFormFiller):
     """Implements the batch form filling logic for the SBII version."""
     
@@ -398,15 +293,14 @@ class BatchFormFiller_SBII(BaseBatchFormFiller):
         return "FDS.COB.FLAG"
     
     def _add_final_mandatory_rows(self, state: dict) -> bool:
+        """Adds SBII-specific jobs: FDS.COB.FLAG and CREATE.FILE.DONE.2."""
         Logger.info("Adding final mandatory rows for SBII version...")
         changes_made = False
         
         last_row_index = max(set(state["main_tables"].values()) | {state["concat_row_index"]})
-
-        # --- [LOGIKA PENGECEKAN DIPERBAIKI] ---
-        # --- Row 1: FDS.COB.FLAG after CONCAT ---
         job_flag_fields = self.utils.find_elements_recursive(By.XPATH, "//input[@value='FDS.COB.FLAG']")
         
+        # Check for and add the first FDS.COB.FLAG job.
         job1_found = False
         for job_field in job_flag_fields:
             try:
@@ -415,11 +309,8 @@ class BatchFormFiller_SBII(BaseBatchFormFiller):
                 verification_field = self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{row_index}:1")
                 if (verification_field and verification_field.get_attribute("value") == "FDS.CBR.CONCAT.FILE.MT"):
                     job1_found = True
-                    Logger.info("Found existing row: FDS.COB.FLAG verified by CONCAT")
                     break
-            except (ValueError, IndexError):
-                continue
-
+            except (ValueError, IndexError): continue
         if not job1_found:
             if not self._click_expand_on_row(last_row_index): return False
             new_row_index = last_row_index + 1
@@ -427,31 +318,22 @@ class BatchFormFiller_SBII(BaseBatchFormFiller):
             self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
             self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
             self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", "JEACE")
-            Logger.success("Added FDS.COB.FLAG verified by CONCAT")
             last_row_index = new_row_index
             changes_made = True
 
-        # --- [LOGIKA PENGECEKAN DIPERBAIKI] ---
-        # --- Row 2: CREATE.FILE.DONE.2 ---
+        # Check for and add the CREATE.FILE.DONE.2 job.
         job2_field = self.utils.find_element_recursive(By.XPATH, "//input[@value='CREATE.FILE.DONE.2']")
-        job2_found = job2_field is not None
-        if job2_found:
-            Logger.info("Found existing row: CREATE.FILE.DONE.2")
-
-        if not job2_found:
+        if not job2_field:
             if not self._click_expand_on_row(last_row_index): return False
             new_row_index = last_row_index + 1
             self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "CREATE.FILE.DONE.2")
             self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
             self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-            Logger.success("Added CREATE.FILE.DONE.2")
             last_row_index = new_row_index
             changes_made = True
 
-        # --- [LOGIKA PENGECEKAN DIPERBAIKI] ---
-        # --- Row 3: FDS.COB.FLAG after CREATE.FILE.DONE.2 ---
+        # Check for and add the final FDS.COB.FLAG job.
         job3_found = False
-        # Gunakan lagi hasil pencarian job_flag_fields dari atas
         for job_field in job_flag_fields:
             try:
                 name_attr = job_field.get_attribute("name")
@@ -459,71 +341,18 @@ class BatchFormFiller_SBII(BaseBatchFormFiller):
                 verification_field = self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{row_index}:1")
                 if (verification_field and verification_field.get_attribute("value") == "CREATE.FILE.DONE.2"):
                     job3_found = True
-                    Logger.info("Found existing row: FDS.COB.FLAG verified by CREATE.FILE.DONE.2")
                     break
-            except (ValueError, IndexError):
-                continue
-        
+            except (ValueError, IndexError): continue
         if not job3_found:
             if not self._click_expand_on_row(last_row_index): return False
             new_row_index = last_row_index + 1
             self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "FDS.COB.FLAG")
             self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "CREATE.FILE.DONE.2")
             self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-            Logger.success("Added FDS.COB.FLAG verified by CREATE.FILE.DONE.2")
             changes_made = True
+            
         return changes_made
 
-    # def _add_final_mandatory_rows(self, state: dict) -> bool:
-    #     Logger.info("Adding final mandatory rows for SBII version...")
-    #     changes_made = False
-        
-    #     # Determine the last row index to expand from
-    #     # last_row_index = max(state["main_tables"].values() | {state["concat_row_index"]})
-    #     last_row_index = max(set(state["main_tables"].values()) | {state["concat_row_index"]})
-
-    #     # --- Row 1: FDS.COB.FLAG after CONCAT ---
-    #     job1_exists = any(v == "FDS.COB.FLAG" and self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{k}:1").get_attribute("value") == "FDS.CBR.CONCAT.FILE.MT"
-    #                       for k, v in state["main_tables"].items())
-    #     if not job1_exists:
-    #         if not self._click_expand_on_row(last_row_index): return False
-    #         new_row_index = last_row_index + 1
-    #         self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "FDS.COB.FLAG")
-    #         self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
-    #         self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-    #         self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", "JEACE")
-    #         Logger.success("Added FDS.COB.FLAG verified by CONCAT")
-    #         last_row_index = new_row_index
-    #         changes_made = True
-
-    #     # --- Row 2: CREATE.FILE.DONE.2 ---
-    #     job2_exists = any(v == "CREATE.FILE.DONE.2" for v in state["main_tables"].values())
-    #     if not job2_exists:
-    #         if not self._click_expand_on_row(last_row_index): return False
-    #         new_row_index = last_row_index + 1
-    #         self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "CREATE.FILE.DONE.2")
-    #         self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
-    #         self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-    #         Logger.success("Added CREATE.FILE.DONE.2")
-    #         last_row_index = new_row_index
-    #         changes_made = True
-
-    #     # --- Row 3: FDS.COB.FLAG after CREATE.FILE.DONE.2 ---
-    #     job3_exists = any(v == "FDS.COB.FLAG" and self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{k}:1").get_attribute("value") == "CREATE.FILE.DONE.2"
-    #                       for k, v in state["main_tables"].items())
-    #     if not job3_exists:
-    #         if not self._click_expand_on_row(last_row_index): return False
-    #         new_row_index = last_row_index + 1
-    #         self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "FDS.COB.FLAG")
-    #         self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "CREATE.FILE.DONE.2")
-    #         self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-    #         Logger.success("Added FDS.COB.FLAG verified by CREATE.FILE.DONE.2")
-    #         changes_made = True
-    #     return changes_made
-
-# ===================================================================
-# CLASS: BATCH Form Handler - KALSEL Version
-# ===================================================================
 class BatchFormFiller_KALSEL(BaseBatchFormFiller):
     """Implements the batch form filling logic for the KALSEL version."""
 
@@ -531,35 +360,28 @@ class BatchFormFiller_KALSEL(BaseBatchFormFiller):
         return "SEACS"
 
     def _get_first_extractor_verification(self) -> Optional[str]:
-        return None # KALSEL does not have verification on the first EB.EXTRACTOR
+        return None
 
     def _add_final_mandatory_rows(self, state: dict) -> bool:
+        """Adds KALSEL-specific jobs: CREATE.FILE.DONE and FDS.COB.FLAG."""
         Logger.info("Adding final mandatory rows for KALSEL version...")
         changes_made = False
 
         last_row_index = max(set(state["main_tables"].values()) | {state["concat_row_index"]})
 
-        # --- [LOGIKA PENGECEKAN DIPERBAIKI] ---
-        # --- Row 1: CREATE.FILE.DONE ---
+        # Check for and add CREATE.FILE.DONE job.
         job1_field = self.utils.find_element_recursive(By.XPATH, "//input[@value='CREATE.FILE.DONE']")
-        job1_found = job1_field is not None
-        if job1_found:
-            Logger.info("Found existing row: CREATE.FILE.DONE")
-
-        if not job1_found:
+        if not job1_field:
             if not self._click_expand_on_row(last_row_index): return False
             new_row_index = last_row_index + 1
             self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "CREATE.FILE.DONE")
             self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
             self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-            Logger.success("Added CREATE.FILE.DONE")
             last_row_index = new_row_index
             changes_made = True
 
-        # --- [LOGIKA PENGECEKAN DIPERBAIKI] ---
-        # --- Row 2: FDS.COB.FLAG after CREATE.FILE.DONE ---
+        # Check for and add final FDS.COB.FLAG job.
         job_flag_fields = self.utils.find_elements_recursive(By.XPATH, "//input[@value='FDS.COB.FLAG']")
-
         job2_found = False
         for job_field in job_flag_fields:
             try:
@@ -568,11 +390,8 @@ class BatchFormFiller_KALSEL(BaseBatchFormFiller):
                 verification_field = self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{row_index}:1")
                 if (verification_field and verification_field.get_attribute("value") == "CREATE.FILE.DONE"):
                     job2_found = True
-                    Logger.info("Found existing row: FDS.COB.FLAG verified by CREATE.FILE.DONE")
                     break
-            except (ValueError, IndexError):
-                continue
-        
+            except (ValueError, IndexError): continue
         if not job2_found:
             if not self._click_expand_on_row(last_row_index): return False
             new_row_index = last_row_index + 1
@@ -580,47 +399,10 @@ class BatchFormFiller_KALSEL(BaseBatchFormFiller):
             self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "CREATE.FILE.DONE")
             self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
             self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", "SEACE")
-            Logger.success("Added FDS.COB.FLAG verified by CREATE.FILE.DONE")
             changes_made = True
             
         return changes_made
 
-    # def _add_final_mandatory_rows(self, state: dict) -> bool:
-    #     Logger.info("Adding final mandatory rows for KALSEL version...")
-    #     changes_made = False
-
-    #     # last_row_index = max(state["main_tables"].values() | {state["concat_row_index"]})
-    #     last_row_index = max(set(state["main_tables"].values()) | {state["concat_row_index"]})
-
-    #     # --- Row 1: CREATE.FILE.DONE ---
-    #     job1_exists = any(v == "CREATE.FILE.DONE" for v in state["main_tables"].values())
-    #     if not job1_exists:
-    #         if not self._click_expand_on_row(last_row_index): return False
-    #         new_row_index = last_row_index + 1
-    #         self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "CREATE.FILE.DONE")
-    #         self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
-    #         self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-    #         Logger.success("Added CREATE.FILE.DONE")
-    #         last_row_index = new_row_index
-    #         changes_made = True
-
-    #     # --- Row 2: FDS.COB.FLAG after CREATE.FILE.DONE ---
-    #     job2_exists = any(v == "FDS.COB.FLAG" and self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{k}:1").get_attribute("value") == "CREATE.FILE.DONE"
-    #                       for k, v in state["main_tables"].items())
-    #     if not job2_exists:
-    #         if not self._click_expand_on_row(last_row_index): return False
-    #         new_row_index = last_row_index + 1
-    #         self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "FDS.COB.FLAG")
-    #         self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "CREATE.FILE.DONE")
-    #         self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-    #         self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", "SEACE")
-    #         Logger.success("Added FDS.COB.FLAG verified by CREATE.FILE.DONE")
-    #         changes_made = True
-    #     return changes_made
-
-# ===================================================================
-# CLASS: BATCH Form Handler - BJI Version
-# ===================================================================
 class BatchFormFiller_BJI(BaseBatchFormFiller):
     """Implements the batch form filling logic for the BJI version."""
 
@@ -631,35 +413,26 @@ class BatchFormFiller_BJI(BaseBatchFormFiller):
         return "FDS.COB.FLAG"
     
     def _add_final_mandatory_rows(self, state: dict) -> bool:
+        """Adds BJI-specific jobs: two FDS.COB.FLAG jobs with different data."""
         Logger.info("Adding final mandatory rows for BJI version...")
         changes_made = False
 
         last_row_index = max(set(state["main_tables"].values()) | {state["concat_row_index"]})
-
-        # --- [LOGIKA PENGECEKAN DIPERBAIKI] ---
-        # --- Row 1: FDS.COB.FLAG with JEACE ---
-        
-        # Cari semua field yang memiliki JOB.NAME = FDS.COB.FLAG
         job_flag_fields = self.utils.find_elements_recursive(By.XPATH, "//input[@value='FDS.COB.FLAG']")
         
-        # Cek kondisi untuk baris pertama (dengan DATA = JEACE)
+        # Check for and add the first FDS.COB.FLAG job (with data).
         job1_found = False
         for job_field in job_flag_fields:
             try:
                 name_attr = job_field.get_attribute("name")
                 row_index = int(name_attr.split(':')[-1])
-
                 verification_field = self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{row_index}:1")
                 data_field = self.utils.find_element_recursive(By.NAME, f"fieldName:DATA:{row_index}:1")
-
                 if (verification_field and verification_field.get_attribute("value") == "FDS.CBR.CONCAT.FILE.MT" and
                     data_field and data_field.get_attribute("value") == "JEACE"):
                     job1_found = True
-                    Logger.info("Found existing row: FDS.COB.FLAG with DATA=JEACE")
                     break
-            except (ValueError, IndexError):
-                continue
-
+            except (ValueError, IndexError): continue
         if not job1_found:
             if not self._click_expand_on_row(last_row_index): return False
             new_row_index = last_row_index + 1
@@ -667,88 +440,180 @@ class BatchFormFiller_BJI(BaseBatchFormFiller):
             self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
             self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
             self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", "JEACE")
-            Logger.success("Added FDS.COB.FLAG verified by CONCAT with DATA=JEACE")
             last_row_index = new_row_index
             changes_made = True
         
-        # --- [LOGIKA PENGECEKAN DIPERBAIKI] ---
-        # --- Row 2: FDS.COB.FLAG without DATA ---
-
-        # Cek kondisi untuk baris kedua (dengan DATA = kosong)
+        # Check for and add the second FDS.COB.FLAG job (without data).
         job2_found = False
-        for job_field in job_flag_fields: # Gunakan hasil pencarian yang sama
+        for job_field in job_flag_fields:
             try:
                 name_attr = job_field.get_attribute("name")
                 row_index = int(name_attr.split(':')[-1])
-
                 verification_field = self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{row_index}:1")
                 data_field = self.utils.find_element_recursive(By.NAME, f"fieldName:DATA:{row_index}:1")
-                
-                # Kondisi data_field.get_attribute("value") == "" akan mencari field DATA yang kosong
                 if (verification_field and verification_field.get_attribute("value") == "FDS.CBR.CONCAT.FILE.MT" and
                     data_field and data_field.get_attribute("value") == ""):
                     job2_found = True
-                    Logger.info("Found existing row: FDS.COB.FLAG with empty DATA")
                     break
-            except (ValueError, IndexError):
-                continue
-
+            except (ValueError, IndexError): continue
         if not job2_found:
             if not self._click_expand_on_row(last_row_index): return False
             new_row_index = last_row_index + 1
             self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "FDS.COB.FLAG")
             self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
             self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-            # Field DATA tidak diisi untuk baris ini
-            Logger.success("Added FDS.COB.FLAG verified by CONCAT without DATA")
             changes_made = True
             
         return changes_made
 
-    # def _add_final_mandatory_rows(self, state: dict) -> bool:
-    #     Logger.info("Adding final mandatory rows for BJI version...")
-    #     changes_made = False
+class BatchFormFiller_JAMKRINDO(BaseBatchFormFiller):
+    """
+    Implements a modified batch form filling logic for JAMKRINDO.
+    It overrides the main execution process to handle unique verification rules,
+    sets a specific Batch Environment, and eliminates final mandatory rows.
+    """
 
-    #     # last_row_index = max(state["main_tables"].values() | {state["concat_row_index"]})
-    #     last_row_index = max(set(state["main_tables"].values()) | {state["concat_row_index"]})
+    def _add_final_mandatory_rows(self, state: dict) -> bool:
+        """
+        Overrides the base method to do nothing.
+        No fields will be added after the CONCAT job for this version.
+        """
+        Logger.info("No final mandatory rows will be added for JAMKRINDO version.")
+        return False
 
-    #     # --- Row 1: FDS.COB.FLAG with JEACE ---
-    #     job1_exists = any(v == "FDS.COB.FLAG" and self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{k}:1").get_attribute("value") == "FDS.CBR.CONCAT.FILE.MT" 
-    #                                           and self.utils.find_element_recursive(By.NAME, f"fieldName:DATA:{k}:1").get_attribute("value") == "JEACE"
-    #                       for k, v in state["main_tables"].items())
-    #     if not job1_exists:
-    #         if not self._click_expand_on_row(last_row_index): return False
-    #         new_row_index = last_row_index + 1
-    #         self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "FDS.COB.FLAG")
-    #         self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
-    #         self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-    #         self._fill_field_by_name(f"fieldName:DATA:{new_row_index}:1", "JEACE")
-    #         Logger.success("Added FDS.COB.FLAG verified by CONCAT with DATA=JEACE")
-    #         last_row_index = new_row_index
-    #         changes_made = True
-        
-    #     # --- Row 2: FDS.COB.FLAG without DATA ---
-    #     job2_exists = any(v == "FDS.COB.FLAG" and self.utils.find_element_recursive(By.NAME, f"fieldName:VERIFICATION:{k}:1").get_attribute("value") == "FDS.CBR.CONCAT.FILE.MT" 
-    #                                           and self.utils.find_element_recursive(By.NAME, f"fieldName:DATA:{k}:1").get_attribute("value") == ""
-    #                       for k, v in state["main_tables"].items())
-    #     if not job2_exists:
-    #         if not self._click_expand_on_row(last_row_index): return False
-    #         new_row_index = last_row_index + 1
-    #         self._fill_field_by_name(f"fieldName:JOB.NAME:{new_row_index}", "FDS.COB.FLAG")
-    #         self._fill_field_by_name(f"fieldName:VERIFICATION:{new_row_index}:1", "FDS.CBR.CONCAT.FILE.MT")
-    #         self._fill_field_by_name(f"fieldName:FREQUENCY:{new_row_index}", "D")
-    #         Logger.success("Added FDS.COB.FLAG verified by CONCAT without DATA")
-    #         changes_made = True
-    #     return changes_made
-    
+    def execute_filling_process(self, table_names_from_file: List[str]) -> bool:
+        """
+        A completely overridden execution process to implement the custom logic
+        for adding EB.EXTRACTOR jobs with specific verification rules.
+        """
+        try:
+            Logger.info("[JAMKRINDO] Starting custom batch filling process.")
+            changes_made = False
 
-# ===================================================================
-# CLASS: BATCH Form Handler - JAMBI Version (FINAL FIX)
-# ===================================================================
+            # Set the mandatory Batch Environment to 'F'.
+            Logger.info("Setting mandatory Batch Environment to 'F'...")
+            success, changed = self.utils.select_radio_value_recursive("radio:tab1:BATCH.ENVIRONMENT", "F")
+            if not success:
+                Logger.error("Failed to set mandatory Batch Environment radio button.")
+                return False
+            if changed:
+                changes_made = True
+
+            # The list of tables is now passed as a parameter.
+            if not table_names_from_file:
+                Logger.warning("No tables were provided to process for this batch.")
+                return True
+
+            initial_state = self._scan_form_for_all_tables(use_cache=False)
+            existing_tables = initial_state.get("all_tables", set())
+            
+            missing_tables = [t for t in table_names_from_file if t not in existing_tables]
+
+            if not missing_tables:
+                Logger.plain("No new jobs to add. All tables already exist in the form.")
+                changes_made = False
+            else:
+                Logger.info(f"Found {len(missing_tables)} new jobs to add.")
+                changes_made = True
+                
+                # Find the correct insertion point before adding new jobs.
+                insertion_point = 0
+                concat_row_index = initial_state.get("concat_row_index", 0)
+
+                if concat_row_index > 0:
+                    insertion_point = concat_row_index - 1
+                    Logger.info(f"CONCAT job found at row {concat_row_index}. New jobs will be inserted after row {insertion_point}.")
+                else:
+                    all_job_inputs = self.utils.find_elements_recursive(By.XPATH, "//input[starts-with(@name, 'fieldName:JOB.NAME:')]")
+                    if all_job_inputs:
+                        if len(all_job_inputs) == 1 and not all_job_inputs[0].get_attribute("value"):
+                            insertion_point = 0
+                            Logger.info("Form is empty. Starting from row 1.")
+                        else:
+                            insertion_point = max([int(f.get_attribute("name").split(":")[-1]) for f in all_job_inputs])
+                            Logger.info(f"CONCAT job not found. Inserting after last known row: {insertion_point}.")
+                
+                last_row_index = insertion_point
+                
+                has_existing_extractors = any(
+                    "EB.EXTRACTOR" in val for val in initial_state.get("main_tables", {}).keys()
+                )
+                
+                # Loop through missing tables and add them one by one.
+                for table_to_add in missing_tables:
+                    if last_row_index > 0:
+                        if not self._click_expand_on_row(last_row_index): return False
+                    
+                    current_row_num = last_row_index + 1
+                    Logger.info(f"Adding Job {current_row_num}: {table_to_add}")
+
+                    self._fill_field_direct(f"fieldName:JOB.NAME:{current_row_num}", "EB.EXTRACTOR")
+                    self.driver.execute_script(f"document.getElementsByName('fieldName:FREQUENCY:{current_row_num}')[0].value = 'D';")
+                    self._fill_field_direct(f"fieldName:DATA:{current_row_num}:1", table_to_add)
+
+                    # Apply custom logic for the Verification field.
+                    if not has_existing_extractors and last_row_index == 0:
+                        Logger.plain("First extractor job, verification is left empty.")
+                    else:
+                        self._fill_field_direct(f"fieldName:VERIFICATION:{current_row_num}:1", "EB.EXTRACTOR")
+
+                    last_row_index = current_row_num
+            
+            # Re-check the form state before creating the CONCAT job.
+            self._invalidate_form_cache()
+            final_state = self._scan_form_for_all_tables(use_cache=False)
+            concat_row_index = final_state.get("concat_row_index", 0)
+            all_main_jobs = final_state.get("main_tables", {})
+            last_job_index = max(all_main_jobs.values()) if all_main_jobs else 0
+            
+            if concat_row_index == 0 and last_job_index > 0:
+                if not self._click_expand_on_row(last_job_index): return False
+                concat_row_index = last_job_index + 1
+                self._fill_field_direct(f"fieldName:JOB.NAME:{concat_row_index}", "FDS.CBR.CONCAT.FILE.MT")
+                self._fill_field_direct(f"fieldName:VERIFICATION:{concat_row_index}:1", "EB.EXTRACTOR")
+                self.driver.execute_script(f"document.getElementsByName('fieldName:FREQUENCY:{concat_row_index}')[0].value = 'D';")
+                changes_made = True
+            
+            # Fill the data fields for the CONCAT job.
+            if concat_row_index > 0:
+                existing_concat_tables = final_state.get("concat_tables", {}).keys()
+                tables_to_add_to_concat = [t for t in table_names_from_file if t not in existing_concat_tables]
+
+                if tables_to_add_to_concat:
+                    Logger.info(f"Adding {len(tables_to_add_to_concat)} tables to CONCAT job...")
+                    current_sub_index = final_state.get("last_sub_value_index", 0)
+
+                    first_field = self.driver.find_element(By.NAME, f"fieldName:DATA:{concat_row_index}:1")
+                    if first_field and not first_field.get_attribute("value") and tables_to_add_to_concat:
+                        self._fill_field_direct(f"fieldName:DATA:{concat_row_index}:1", tables_to_add_to_concat.pop(0))
+                        current_sub_index = 1
+                    
+                    for table_name in tables_to_add_to_concat:
+                        if not self._click_sub_value_expand_button(concat_row_index, current_sub_index): return False
+                        current_sub_index += 1
+                        field_name = f"fieldName:DATA:{concat_row_index}:{current_sub_index}"
+                        self._fill_field_direct(field_name, table_name)
+                    changes_made = True
+
+            # Call the (empty) final rows method to adhere to the pattern.
+            self._add_final_mandatory_rows(final_state)
+            
+            if changes_made:
+                Logger.success("[JAMKRINDO] Form filling completed successfully.")
+            else:
+                Logger.plain("No changes were made to the form.")
+
+            return True
+
+        except Exception as e:
+            Logger.error(f"[JAMKRINDO] Form processing error: {e}", exc_info=True)
+            self.utils.take_screenshot(f"{self.config.screenshot_dir}/jamkrindo_batch_error.png")
+            return False
+
 class BatchFormFiller_JAMBI:
     """
     Implements the batch form filling logic for the JAMBI version.
-    NOTE: This class has a completely different logic from the others and does not inherit from BaseBatchFormFiller.
+    This version has a unique structure and does not inherit from the base filler.
     """
     def __init__(self, driver, wait, utils: PageUtils, config: AppConfig):
         self.driver = driver
@@ -758,27 +623,24 @@ class BatchFormFiller_JAMBI:
         self.batch_file_path = config.file_path
 
     def _click_expand_on_row(self, row_index: int) -> bool:
-        """Expand multi-value row using JavaScript click."""
+        """Helper to click the expand button for a given row."""
         try:
             xpath = f"//input[contains(@name, 'JOB.NAME:{row_index}')]/ancestor::tr[1]//a[contains(@href, 'javascript:mvExpandClient')]/img"
             
-            Logger.debug(f"Waiting for expand button to be clickable on row {row_index}...")
             expand_button = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
-            
             self.driver.execute_script("arguments[0].click();", expand_button)
             
             new_row_index = row_index + 1
             self.wait.until(EC.presence_of_element_located((By.NAME, f"fieldName:JOB.NAME:{new_row_index}")))
             return True
         except Exception as e:
-            Logger.error(f"Expand click failed on row {row_index}. The button may not be active or visible.")
+            Logger.error(f"Expand click failed on row {row_index}: {e}")
             self.utils.save_page_source(f"{self.config.inspect_dir}/expand_fail_row_{row_index}.html")
             self.utils.take_screenshot(f"{self.config.screenshot_dir}/expand_fail_row_{row_index}.png")
-            Logger.error(f"Full error: {e}")
             return False
 
     def _fill_field_by_name(self, field_name: str, value: str) -> bool:
-        """Fill form field by its name attribute."""
+        """Helper to find and fill a field by its name attribute."""
         try:
             field = self.utils.wait_for_element(By.NAME, field_name, timeout=10)
             if not field:
@@ -789,11 +651,11 @@ class BatchFormFiller_JAMBI:
             field.send_keys(value)
             return True
         except Exception as e:
-            Logger.error(f"Field fill failed for {field_name}: {e}")
+            Logger.error(f"Field fill failed for '{field_name}': {e}")
             return False
             
     def _scan_for_existing_jambi_tables(self) -> Set[str]:
-        """Scans the form to find which tables have already been added for the Jambi version."""
+        """Scans the form to find tables already added for the Jambi version."""
         Logger.info("Scanning form for existing JAMBI tables...")
         existing_tables = set()
         
@@ -813,8 +675,7 @@ class BatchFormFiller_JAMBI:
                     table_name = data_field.get_attribute("value")
                     if table_name:
                         existing_tables.add(table_name)
-            except (ValueError, IndexError) as e:
-                Logger.warning(f"Could not parse row index from field name '{name_attr}': {e}")
+            except (ValueError, IndexError):
                 continue
                 
         Logger.info(f"Found {len(existing_tables)} existing JAMBI tables on the form.")
@@ -868,15 +729,15 @@ class BatchFormFiller_JAMBI:
                     if not self._click_expand_on_row(last_row_index): return False
                     current_row_for_generate = last_row_index + 1
 
-                Logger.plain(f"Adding GENERATE.EXT.REPORT on row {current_row_for_generate}")
+                # Add the GENERATE.EXT.REPORT job.
                 self._fill_field_by_name(f"fieldName:JOB.NAME:{current_row_for_generate}", "GENERATE.EXT.REPORT")
                 self._fill_field_by_name(f"fieldName:FREQUENCY:{current_row_for_generate}", "D")
                 self._fill_field_by_name(f"fieldName:DATA:{current_row_for_generate}:1", table_to_add)
 
+                # Add the FDS.CBR.CONCAT.FILE job that verifies the previous one.
                 if not self._click_expand_on_row(current_row_for_generate): return False
                 current_row_for_concat = current_row_for_generate + 1
                 
-                Logger.plain(f"Adding FDS.CBR.CONCAT.FILE on row {current_row_for_concat}")
                 self._fill_field_by_name(f"fieldName:JOB.NAME:{current_row_for_concat}", "FDS.CBR.CONCAT.FILE")
                 self._fill_field_by_name(f"fieldName:VERIFICATION:{current_row_for_concat}:1", "GENERATE.EXT.REPORT")
                 self._fill_field_by_name(f"fieldName:FREQUENCY:{current_row_for_concat}", "D")
@@ -893,16 +754,8 @@ class BatchFormFiller_JAMBI:
             self.utils.take_screenshot(f"{self.config.screenshot_dir}/form_error_jambi.png")
             return False
 
-# ?    
-# ! New Form Filler for Batch
-# ?    
-
-
-# ===================================================================
-# CLASS: REPORT Form Handler
-# ===================================================================
 class ReportFormFiller:
-    """Fills report configuration forms"""
+    """Fills the EXT.REPORT configuration forms."""
     
     def __init__(self, driver, wait, utils: PageUtils, config: AppConfig):
         self.driver = driver
@@ -912,22 +765,20 @@ class ReportFormFiller:
         self.reset_extractor_cache()
 
     def reset_extractor_cache(self):
-        """Reset field detection cache"""
+        """Reset the field detection cache for a new form."""
         self.existing_extractors_cache = None
         self.last_filled_index_cache = None
 
     def get_existing_extractors(self) -> list:
-        """Get existing extractors with caching"""
+        """Get a list of existing extractors from the form, with caching."""
         if self.existing_extractors_cache is not None:
             return self.existing_extractors_cache
             
-        # Find all label fields
         all_label_fields = self.utils.find_elements_recursive(
             By.CSS_SELECTOR, 
             "input[name^='fieldName:REP.FLD.LABEL:']"
         )
         
-        # Normalize values (lowercase + trim)
         existing = []
         for field in all_label_fields:
             value = field.get_attribute("value")
@@ -939,8 +790,7 @@ class ReportFormFiller:
         return existing
     
     def fill_mandatory_fields(self, table_name: str) -> bool:
-        """Fill required fields for report configuration"""
-        # Generate field values based on table name
+        """Fill the main, required fields for the report configuration."""
         short_name = table_name.replace("ST.","",1) if table_name.startswith("ST.") else table_name
         test_last_name = (
             table_name.replace("ST.", "", 1).replace(".TEST", "")
@@ -948,7 +798,7 @@ class ReportFormFiller:
         )
         mandatory_fields = {
             "fieldName:DESCRIPTION": f"TABLE {short_name} SIMIAN",
-            "fieldName:APPLICATION": test_last_name, # ! Gunakan short_name
+            "fieldName:APPLICATION": test_last_name,
             "fieldName:TARGET.FILE": f"ST.{short_name}.csv",
             "fieldName:OUTPUT.DIR": "CBR.BP",
             "fieldName:SEPARATOR": ";"
@@ -956,23 +806,12 @@ class ReportFormFiller:
         
         try:
             Logger.info("Filling mandatory fields...")
-            # Handle radio button selection
-            radio_button_locator = (By.NAME, "radio:tab1:EXT.APP")
-            try:
-                # Wait until ALL elements with that name are in the DOM
-                self.wait.until(EC.presence_of_all_elements_located(radio_button_locator))
-                Logger.debug("Radio buttons found by NAME.")
-            except Exception:
-                # Fallback if search by NAME fails, try by CSS
-                Logger.debug("Radio buttons not found by NAME, trying CSS selector.")
-                radio_button_locator_css = (By.CSS_SELECTOR, "input[type='radio'][name='radio:tab1:EXT.APP']")
-                self.wait.until(EC.presence_of_all_elements_located(radio_button_locator_css))
-                Logger.debug("Radio buttons found by CSS.")
             
+            # Select the 'N' option for the EXT.APP radio button.
             if not self.utils.select_radio_value_recursive("radio:tab1:EXT.APP", "N"): 
                 return False
             
-            # Fill each mandatory field
+            # Fill each mandatory field if it is empty.
             for field_name, value in mandatory_fields.items():
                 field = self.utils.wait_for_element(By.NAME, field_name)
                 if field:
@@ -980,74 +819,66 @@ class ReportFormFiller:
                     if not current_value or current_value.strip() == "":
                         if not self._fill_field(field_name, value): 
                             return False
-                    else:
-                        Logger.plain(f'Field {field_name} already contains: {current_value}')
                 else:
-                    Logger.error(f"Field {field_name} not found")
+                    Logger.error(f"Mandatory field '{field_name}' not found.")
                     return False
             return True
         except Exception as e:
-            Logger.error(f"Mandatory field error: {e}")
+            Logger.error(f"Error filling mandatory fields: {e}")
             return False
 
     def _fill_field(self, name: str, value: str) -> bool:
-        """Generic field filling method"""
+        """Generic helper method to fill a single field."""
         try:
             field = self.utils.find_element_recursive(By.NAME, name)
             if not field:
-                Logger.error(f"Field '{name}' not found")
+                Logger.error(f"Field '{name}' not found.")
                 return False
             self.wait.until(EC.visibility_of(field))
             field.clear()
             field.send_keys(value)
             return True
         except Exception as e:
-            Logger.error(f"Field fill error '{name}': {e}")
+            Logger.error(f"Field fill error for '{name}': {e}")
             return False
 
     def fill_dynamic_fields(self, extractor_fields: list) -> bool:
-        """Fill dynamic extractor fields"""
-        self._has_logged_new_extractors = False
-
+        """Fill the dynamic list of extractor fields at the bottom of the form."""
         try:
             if not extractor_fields: 
                 return True
                 
             existing_extractors = self.get_existing_extractors()
-            
-            # Normalize extractor names for comparison
             normalized_extractors = [f.strip().lower() for f in extractor_fields]
             
-            # Identify new extractors
+            # Determine which fields from the input are new.
             new_extractors = [
                 orig for orig, norm in zip(extractor_fields, normalized_extractors)
                 if norm not in existing_extractors
             ]
             
             if not new_extractors:
-                Logger.plain("All extractors already exist")
+                Logger.plain("All extractor fields already exist.")
                 return True
                 
-            if not self._has_logged_new_extractors:
-                Logger.plain(f"Adding {len(new_extractors)} new extractors")
-                self._has_logged_new_extractors = True
+            Logger.plain(f"Adding {len(new_extractors)} new extractor fields...")
 
-            # Determine starting index
+            # Find the last filled row to start adding from.
             last_filled = self._get_last_filled_index()
             start_index = last_filled + 1
             
-            # Fill new extractors
+            # Loop and fill each new extractor.
             for i, field_val in enumerate(new_extractors, start=start_index):
                 if not self._fill_field_set(i, field_val): 
                     return False
                     
             return True
         except Exception as e:
-            Logger.error(f"Dynamic field error: {e}")
+            Logger.error(f"Dynamic field filling error: {e}")
             return False
         
     def _get_last_filled_index(self) -> int:
-        """Get highest filled index in form"""
+        """Get the highest index of a filled row in the dynamic list."""
         if self.last_filled_index_cache is not None: 
             return self.last_filled_index_cache
             
@@ -1062,48 +893,41 @@ class ReportFormFiller:
                     current_index = int(name_attr.split(':')[-1])
                     if current_index > last_index: 
                         last_index = current_index
-                except: 
-                    continue
+                except: continue
                     
         self.last_filled_index_cache = last_index
         return last_index
     
     def _fill_field_set(self, index: int, value: str) -> bool:
-        """Fill complete field set for one extractor"""
-        if not self._handle_label_field(index, value): 
-            return False
-        if not self._handle_dropdown(index): 
-            return False
-        if not self._handle_value_field(index, value): 
-            return False
+        """Fill a complete set of fields for one extractor row."""
+        if not self._handle_label_field(index, value): return False
+        if not self._handle_dropdown(index): return False
+        if not self._handle_value_field(index, value): return False
         return True
     
     def _handle_label_field(self, index: int, value: str) -> bool:
-        """Fill label field with expand handling"""
+        """Fill the label field, expanding the form if necessary."""
         try:
             label_field_name = f"fieldName:REP.FLD.LABEL:{index}"
             label_field = self.utils.find_element_recursive(By.NAME, label_field_name)
             
-            # Expand form if field not found
             if not label_field:
-                if not self._expand_form(index): 
-                    return False
+                if not self._expand_form(index): return False
                 label_field = self.utils.wait_for_element(By.NAME, label_field_name)
                 if not label_field: 
-                    raise TimeoutError(f"Field {label_field_name} missing after expand")
+                    raise TimeoutError(f"Field {label_field_name} not found after expand.")
             
             self.wait.until(EC.visibility_of(label_field))
             if not label_field.get_attribute("value").strip():
                 label_field.send_keys(value)
-                label_field.send_keys(Keys.TAB)
-                Logger.plain(f"Filled LABEL.{index}")
+                label_field.send_keys(Keys.TAB) # Tab out to trigger potential JS.
             return True
         except Exception as e:
-            Logger.error(f"LABEL field error {index}: {e}")
+            Logger.error(f"LABEL field error at index {index}: {e}")
             return False
     
     def _expand_form(self, index: int) -> bool:
-        """Expand form section for new fields"""
+        """Expand the form to reveal a new row for dynamic fields."""
         try:
             self.driver.switch_to.default_content()
             expand_xpath = f"//tr[contains(@mvlist, 'M_13.{index}_23.{index}')]//a[contains(@href, 'mvExpandClient')]/img"
@@ -1112,48 +936,55 @@ class ReportFormFiller:
             self.wait.until(lambda d: self.utils.find_element_recursive(By.NAME, f"fieldName:REP.FLD.LABEL:{index}"))
             return True
         except Exception as e:
-            Logger.error(f"Expand error {index}: {type(e).__name__}: {e}")
+            Logger.error(f"Expand form error at index {index}: {e}")
             self.utils.save_page_source(f"{self.config.inspect_dir}/expand_fail_index_{index}.html")
-            self.utils.take_screenshot(f"{self.config.screenshot_dir}/expand_fail_index_{index}.png")
             return False
     
     def _handle_dropdown(self, index: int) -> bool:
-        """Set default value in dropdown"""
+        """Set the default 'Fld' value in the dropdown for an extractor row."""
         try:
             dropdown_name = f"fieldName:REP.FLD.EXT:{index}:1"
             dropdown = self.utils.wait_for_element(By.NAME, dropdown_name, timeout=5)
             if not dropdown:
-                 Logger.error(f"Dropdown {dropdown_name} not found")
+                 Logger.error(f"Dropdown {dropdown_name} not found.")
                  return False
             select = Select(dropdown)
             if not select.first_selected_option.text.strip():
                 select.select_by_visible_text("Fld")
             return True
         except Exception as e:
-            Logger.error(f"Dropdown error {index}: {e}")
+            Logger.error(f"Dropdown error at index {index}: {e}")
             return False
     
     def _handle_value_field(self, index: int, value: str) -> bool:
-        """Fill value field"""
+        """Fill the value field for an extractor row."""
         try:
             val_field_name = f"fieldName:REP.FLD.VAL1:{index}:1"
             val_field = self.utils.wait_for_element(By.NAME, val_field_name, timeout=5)
             if not val_field:
-                Logger.error(f"Value field {val_field_name} not found")
+                Logger.error(f"Value field {val_field_name} not found.")
                 return False
             if not val_field.get_attribute("value").strip():
                 val_field.send_keys(value)
                 val_field.send_keys(Keys.TAB)
             return True
         except Exception as e:
-            Logger.error(f"VALUE field error {index}: {e}")
+            Logger.error(f"VALUE field error at index {index}: {e}")
+            return False
+    
+    def _fill_field_direct(self, name: str, value: str) -> bool:
+        """A fast, non-recursive method to fill a field, assuming the driver is already in the correct frame."""
+        try:
+            field = self.driver.find_element(By.NAME, name)
+            field.clear()
+            field.send_keys(value)
+            return True
+        except Exception as e:
+            Logger.error(f"Direct field fill error for '{name}': {e}")
             return False
 
-# ===================================================================
-# CLASS: DFE PARAMETER Form Handler
-# ===================================================================
 class DfeParamFormFiller:
-    """Fills DFE.PARAMETER configuration forms"""
+    """Fills DFE.PARAMETER configuration forms."""
     
     def __init__(self, driver, wait, utils: PageUtils):
         self.driver = driver
@@ -1161,27 +992,14 @@ class DfeParamFormFiller:
         self.utils = utils
 
     def fill_form(self, table_name: str) -> bool:
-        """Fill all required fields for DFE configuration with improved logging."""
+        """Fill all required fields for a DFE.PARAMETER record."""
         Logger.info(f"Checking/Filling DFE form for table: {table_name}")
         try:
-            # Flag to track if any changes were made
             changes_made = False
+            self.wait.until(EC.presence_of_all_elements_located((By.NAME, "radio:tab1:IN.OUT.TYPE")))
 
-            # Wait for the form element to be ready
-            Logger.info("Waiting for DFE form elements to be present...")
-            radio_button_locator = (By.NAME, "radio:tab1:IN.OUT.TYPE")
-            try:
-                self.wait.until(EC.presence_of_all_elements_located(radio_button_locator))
-                Logger.debug("Radio buttons found.")
-            except Exception as e:
-                Logger.error(f"Timed out waiting for radio buttons: {e}")
-                self.utils.take_screenshot("screenshots/radio_button_wait_failed.png")
-                return False
-
-            # Field and value definitions
-            description = (
-                table_name.replace("ST.", "", 1).strip() + " EXTRACTION"
-            )
+            description = table_name.replace("ST.", "", 1).strip() + " EXTRACTION"
+            dfe_mapping_id = "ST." + table_name.replace("ST.", "", 1).replace(".TEST", "").strip()
             out_file_name = f"{table_name}.csv"
             
             radio_buttons = {
@@ -1190,37 +1008,33 @@ class DfeParamFormFiller:
             }
             text_fields = {
                 "fieldName:DESCRIPTION:1:1": description,
-                "fieldName:DFE.MAPPING.ID": table_name.replace(".TEST", "").strip(), # ! change to table_name in prod
+                "fieldName:DFE.MAPPING.ID": dfe_mapping_id,
                 "fieldName:OUTPUT.DIR": "../DFE",
                 "fieldName:ARCHIVE.DIR": "../DFE",
                 "fieldName:OUT.FILE.NAME": out_file_name,
             }
 
-            # Radio Button charging logic
             for name, value in radio_buttons.items():
                 success, changed = self.utils.select_radio_value_recursive(name, value)
-                if not success:
-                    Logger.error(f"Failed to handle radio button '{name}'")
-                    return False
-                if changed:
-                    changes_made = True
+                if not success: return False
+                if changed: changes_made = True
 
-            # Fill Text Field 
+            # Check and fill text fields only if their current value is incorrect.
             for name, value in text_fields.items():
                 field = self.utils.wait_for_element(By.NAME, name)
                 if field:
-                    # Fill only if field is empty
-                    if field.get_attribute("value") == "":
+                    current_value = field.get_attribute("value")
+                    if current_value != value:
+                        Logger.plain(f"Field '{name}' has incorrect value. Updating to '{value}'.")
                         self.driver.execute_script("arguments[0].value = arguments[1];", field, value)
                         self.driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", field)
-                        Logger.plain(f"Filled '{name}' with '{value}'")
                         changes_made = True
                 else:
                     Logger.error(f"Field '{name}' not found")
                     return False
             
             if not changes_made:
-                Logger.plain("All fields already exist.")
+                Logger.plain("All fields already have the correct values.")
             
             Logger.success(f"DFE form for '{table_name}' check/fill process completed.")
             return True
@@ -1229,44 +1043,73 @@ class DfeParamFormFiller:
             Logger.error(f"An error occurred while filling the DFE form: {e}")
             return False
 
-# ===================================================================
-# CLASS: DFE Mapping Form Handler (Inherits from ReportFormFiller)
-# ===================================================================
-class DfeMappingFormFiller(ReportFormFiller):
+class DfeMappingFormFiller:
     """
-    Fills DFE.MAPPING forms. Inherits from ReportFormFiller
-    and overrides methods for mandatory and dynamic fields.
+    Fills DFE.MAPPING forms with a high-performance, standalone approach.
+    It assumes the driver is already in the correct frame context.
     """
+
+    def __init__(self, driver, wait, utils: PageUtils, config: AppConfig):
+        self.driver = driver
+        self.wait = wait
+        self.utils = utils
+        self.config = config
+        self.existing_fields_cache = None
+
+    def reset_cache(self):
+        """Resets the cache of existing fields for a new form."""
+        self.existing_fields_cache = None
+        
+    def _fill_field_direct(self, name: str, value: str) -> bool:
+        """A fast, non-recursive method to fill a field."""
+        try:
+            field = self.driver.find_element(By.NAME, name)
+            field.clear()
+            field.send_keys(value)
+            return True
+        except Exception as e:
+            Logger.error(f"Direct field fill error for '{name}': {e}")
+            return False
 
     def _scan_existing_appl_fields(self) -> list:
-        """Scans and returns a list of existing APPL.FIELD.NAME values."""
-        if self.existing_extractors_cache is not None:
-            return self.existing_extractors_cache
-            
-        all_label_fields = self.utils.find_elements_recursive(
-            By.CSS_SELECTOR, 
-            "input[name^='fieldName:APPL.FIELD.NAME:']"
-        )
+        """
+        Scans for existing fields non-recursively, using iterative scrolling
+        to handle potential lazy-loading of elements.
+        """
+        if self.existing_fields_cache is not None:
+            return self.existing_fields_cache
+
+        Logger.info("Scanning for existing fields with iterative scroll...")
         
+        last_count = -1
+        while True:
+            all_label_fields = self.driver.find_elements(By.CSS_SELECTOR, "input[name^='fieldName:APPL.FIELD.NAME:']")
+            current_count = len(all_label_fields)
+            
+            if current_count == last_count:
+                break
+            
+            last_count = current_count
+            
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView(true);", all_label_fields[-1])
+                time.sleep(1.5) 
+            except IndexError:
+                break
+        
+        Logger.info(f"Scan complete. Total fields found: {last_count}")
+
         existing = [field.get_attribute("value") for field in all_label_fields if field.get_attribute("value")]
-        self.existing_extractors_cache = existing
-        Logger.info(f"Found {len(existing)} existing mapping fields.")
+        self.existing_fields_cache = existing
         return existing
-    
+
     def fill_mandatory_fields(self, table_name: str) -> bool:
-        """Overrides parent method to fill DFE.MAPPING mandatory fields."""
+        """Fills the main mandatory fields for a DFE.MAPPING record."""
         Logger.info("Filling DFE.MAPPING mandatory fields...")
         try:
-            # Wait for the stable form element to appear, indicating that the form is ready.
-            Logger.debug("Waiting for DFE Mapping form to be ready...")
-            self.wait.until(EC.presence_of_element_located((By.NAME, "fieldName:FILE.NAME")))
-            Logger.debug("DFE Mapping form is ready.")
-
-            # Generate dynamic values
-            file_name_val = table_name.replace("ST.", "", 1).replace(".TEST", "")
+            file_name_val = table_name.replace("ST.", "", 1).replace(".TEST", "") # ! Change this with your reqruitment
             description_val = table_name.replace("ST.", "", 1) + " EXTRACTOR"
-
-            # Define fields and values
+            
             text_fields = {
                 "fieldName:FILE.NAME": file_name_val,
                 "fieldName:DESCRIPTION:1:1": description_val,
@@ -1276,98 +1119,115 @@ class DfeMappingFormFiller(ReportFormFiller):
                 "fieldName:ID.POSITION": "1",
             }
 
-            # Handle radio button
             success, _ = self.utils.select_radio_value_recursive("radio:tab1:ID.GEN.TYPE", "Data")
             if not success: return False
 
-            # Handle text fields
             for name, value in text_fields.items():
-                field = self.utils.wait_for_element(By.NAME, name, timeout=5)
+                field = self.driver.find_element(By.NAME, name)
                 if field and not field.get_attribute("value"):
-                    if not self._fill_field(name, value):
-                        return False
+                    self._fill_field_direct(name, value)
+
+            # ? add mandatory fields specific to the STMT.ENTRY, CATEG.ENTRY, RE.CONSOL.SPEC.ENTRY table 
+            selection_value = None
+            if "STMT.ENTRY" in table_name:
+                selection_value = "@DFE.SELECT.STMT.LWORK"
+            elif "CATEG.ENTRY" in table_name:
+                selection_value = "@DFE.SELECT.CATEG.LWORK"
+            elif "RE.CONSOL.SPEC.ENTRY" in table_name:
+                selection_value = "@DFE.SELECT.RE.SPEC.LWORK"
+            
+            if selection_value:
+                Logger.info(f"Special table detected. Setting FILE.SELECTION to: {selection_value}")
+                if not self._fill_field_direct("fieldName:FILE.SELECTION:1", selection_value):
+                    return False # Gagal jika tidak bisa mengisi field
+
             return True
         except Exception as e:
-            Logger.error(f"Failed to fill DFE.MAPPING mandatory fields: {e}")
+            Logger.error(f"Failed to fill mandatory fields: {e}")
             return False
 
-    def _fill_field_set(self, index: int, value: str) -> bool:
-        """Overrides parent method to fill a single row of mapping fields."""
-        try:
-            # 1. Fill APPL.FIELD.NAME
-            if not self._fill_field(f"fieldName:APPL.FIELD.NAME:{index}", value): return False
-            # 2. Fill APPL.FIELD.TEXT
-            if not self._fill_field(f"fieldName:APPL.FIELD.TEXT:{index}", value): return False
-            # 3. Fill FIELD.POSITION
-            if not self._fill_field(f"fieldName:FIELD.POSITION:{index}", str(index)): return False
-            Logger.plain(f"Filled mapping row {index} for field '{value}'")
-            return True
-        except Exception as e:
-            Logger.error(f"Failed to fill mapping field set for index {index}: {e}")
-            return False
+    def _get_last_filled_index(self) -> int:
+        """Helper to get the last index of a filled field in the dynamic list."""
+        last_index = 0
+        all_label_fields = self.driver.find_elements(By.CSS_SELECTOR, "input[name^='fieldName:APPL.FIELD.NAME:']")
+        for field in all_label_fields:
+            if field.get_attribute("value").strip():
+                try:
+                    current_index = int(field.get_attribute("name").split(':')[-1])
+                    if current_index > last_index:
+                        last_index = current_index
+                except (ValueError, IndexError):
+                    continue
+        return last_index
 
-    def fill_dynamic_fields(self, extractor_fields: list) -> bool:
+    def fill_dynamic_fields_batched(self, extractor_fields: list) -> bool:
         """
-        Overrides parent method to orchestrate filling the dynamic mapping list.
+        Fills all dynamic fields using a single, large JavaScript command for maximum performance.
         """
-        self._has_logged_new_extractors = False
         try:
-            if not extractor_fields: return True
-                
+            if not extractor_fields:
+                return True
+
             existing_fields = self._scan_existing_appl_fields()
             new_fields = [f for f in extractor_fields if f not in existing_fields]
-            
+
             if not new_fields:
                 Logger.plain("All mapping fields already exist.")
                 return True
-            
-            Logger.plain(f"New mapping fields to add: {len(new_fields)}")
-            
-            last_filled_index = len(existing_fields)
-            
-            for i, field_val in enumerate(new_fields, start=1):
-                current_index_to_fill = last_filled_index + i
-                
-                # Check whether the field to be filled in already exists or not
-                label_field = self.utils.find_element_recursive(By.NAME, f"fieldName:APPL.FIELD.NAME:{current_index_to_fill}")
-                if not label_field:
-                    # If none, click expand from the previous row
-                    index_to_expand_from = current_index_to_fill - 1
-                    if index_to_expand_from == 0:
-                        Logger.error("Cannot expand from index 0. First row should exist.")
-                        return False
-                    if not self._expand_form(index_to_expand_from): return False
 
-                # Fill the field set for the current row
-                if not self._fill_field_set(current_index_to_fill, field_val): return False
-                    
-            return True
+            Logger.info(f"Adding {len(new_fields)} new mapping fields.")
+
+            last_filled_index = self._get_last_filled_index()
+
+            # This single JavaScript block performs the entire loop, which is much faster
+            # than making separate calls from Python for each row.
+            js_batch_script = """
+            // Arguments received from Python: fieldsToAdd (array), startIndex (number)
+            const fieldsToAdd = arguments[0];
+            const startIndex = arguments[1];
+
+            // The loop now happens inside the browser's fast JS engine.
+            for (let i = 0; i < fieldsToAdd.length; i++) {
+                const currentIndexToExpand = startIndex + i;
+                const currentIndexToFill = currentIndexToExpand + 1;
+                const valueToFill = fieldsToAdd[i];
+
+                // Step 1: Expand a new row by calling the application's JS function.
+                if (currentIndexToExpand > 0) {
+                    try {
+                        const row = document.querySelector("input[name='fieldName:APPL.FIELD.NAME:" + currentIndexToExpand + "']").closest('tr');
+                        const mvlist = row.getAttribute('mvlist');
+                        if (mvlist) {
+                            mvExpandClient(mvlist, '0', '0');
+                        }
+                    } catch (e) {
+                        return { success: false, error: "Expand failed at index " + currentIndexToExpand + ": " + e.message };
+                    }
+                }
+
+                // Step 2: Fill the fields in the newly created row.
+                try {
+                    document.querySelector("input[name='fieldName:APPL.FIELD.NAME:" + currentIndexToFill + "']").value = valueToFill;
+                    document.querySelector("input[name='fieldName:APPL.FIELD.TEXT:" + currentIndexToFill + "']").value = valueToFill;
+                    document.querySelector("input[name='fieldName:FIELD.POSITION:" + currentIndexToFill + "']").value = currentIndexToFill;
+                } catch (e) {
+                    return { success: false, error: "Fill failed at index " + currentIndexToFill + ": " + e.message };
+                }
+            }
+            // Return a success status if the entire loop completes.
+            return { success: true };
+            """
+
+            result = self.driver.execute_script(js_batch_script, new_fields, last_filled_index)
+
+            if result and result.get('success'):
+                Logger.success(f"Completed filling all {len(new_fields)} new fields via batch.")
+                return True
+            else:
+                error_message = result.get('error', 'Unknown JavaScript execution error.')
+                Logger.error(f"Batched JavaScript execution failed: {error_message}")
+                return False
+
         except Exception as e:
-            Logger.error(f"Failed to fill dynamic mapping fields: {e}")
-            return False
-        
-    def _expand_form(self, index_to_expand_from: int) -> bool:
-        """
-        Overrides the parent method with a locator specific to DFE.MAPPING.
-        Clicks the expand button on the last known row to create a new row.
-        """
-        Logger.info(f"Expanding form from row {index_to_expand_from} to create a new row...")
-        try:
-            # This XPath looks for input from the last line, and then looks for the ‘Expand’ image on the same line.
-            expand_xpath = f"//input[@name='fieldName:APPL.FIELD.NAME:{index_to_expand_from}']/ancestor::tr[1]//img[@title='Expand Multi Value']"
-            
-            expand_btn = self.wait.until(EC.element_to_be_clickable((By.XPATH, expand_xpath)))
-            
-            # Use Javascript for clicking
-            self.driver.execute_script("arguments[0].click();", expand_btn)
-            
-            # Wait for the field in the new row to appear as confirmation
-            new_index = index_to_expand_from + 1
-            self.wait.until(EC.presence_of_element_located((By.NAME, f"fieldName:APPL.FIELD.NAME:{new_index}")))
-            Logger.debug(f"Successfully expanded form, new row {new_index} is present.")
-            return True
-        except Exception as e:
-            Logger.error(f"Expand error at row {index_to_expand_from}: {type(e).__name__}: {e}")
-            self.utils.save_page_source(f"{self.config.inspect_dir}/expand_fail_index_{index_to_expand_from}.html")
-            self.utils.take_screenshot(f"{self.config.screenshot_dir}/expand_fail_index_{index_to_expand_from}.png")
+            Logger.error(f"Batched dynamic field filling failed with a Python error: {e}")
             return False

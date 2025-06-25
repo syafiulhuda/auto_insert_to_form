@@ -1,5 +1,5 @@
 class Logger:
-    """Logging utility"""
+    """A simple, static logging utility."""
     
     @staticmethod
     def plain(message: str):

@@ -1,6 +1,6 @@
 # 📘 Project Setup Guide
 
-Panduan singkat untuk menyiapkan environment, source, dan konfigurasi proyek Anda.
+Panduan singkat untuk menyiapkan environment, source, dan konfigurasi untuk menjalankan program.
 
 ---
 
@@ -11,6 +11,7 @@ Panduan singkat untuk menyiapkan environment, source, dan konfigurasi proyek And
    venv\Scripts\activate
 
 2. **Install Dependencies:**
+    ```bash
     pip install -r req.txt
 
 3. **Isi Nama Table / List Extractor di Source:**
