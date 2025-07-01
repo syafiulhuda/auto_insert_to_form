@@ -91,7 +91,7 @@ def main():
     }
 
     print("\nSelect execution mode:")
-    print("1. Batch Mode\n2. Report Mode\n3. DFE Parameter Mode\n4. DFE Map Mode")
+    print("1. Batch Mode\n2. EXT Report Mode\n3. DFE Parameter Mode\n4. DFE Map Mode")
     mode_choice = input("Choice: ").strip()
     mode = mode_map.get(mode_choice)
     if not mode:
@@ -173,9 +173,16 @@ def main():
     os.makedirs(config.inspect_dir, exist_ok=True)
 
     # Validate that the password has been filled in the config file.
-    if not config.password or config.password == 'YourPassword':
-        Logger.error(f"Password not found or not filled in {config_file}.")
-        Logger.error("Please fill in the password under the [WEB] section and restart.")
+    # if not config.password or config.password == 'YourPassword':
+    #     Logger.error(f"Password not found or not filled in {config_file}.")
+    #     Logger.error("Please fill in the password under the [WEB] section and restart.")
+    #     input("Press ENTER to exit.")
+    #     return
+    
+    default_password_placeholder = "YourPassword"
+    if config.password == default_password_placeholder:
+        Logger.error(f"Password not configured in {config_file}.")
+        Logger.error("Please edit the password field under the [WEB] section and restart.")
         input("Press ENTER to exit.")
         return
 

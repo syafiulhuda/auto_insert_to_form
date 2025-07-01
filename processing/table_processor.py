@@ -1,3 +1,5 @@
+import os
+from core.extractor_validator import ExtractorValidator
 from core.logger import Logger
 from config.config_manager import AppConfig
 from core.page_utils import PageUtils
@@ -10,7 +12,7 @@ from core.form_filler import ReportFormFiller
 from core.form_filler import DfeParamFormFiller
 from core.form_filler import DfeMappingFormFiller
 
-from typing import Dict
+from typing import Dict, List
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -144,8 +146,12 @@ class BatchProcessor:
     #     Logger.info("All batch jobs have been processed.")
     #     return all_batches_successful
 
+# ! NEW CLASS
 class ReportProcessor:
-    """Orchestrates the report generation workflow."""
+    """
+    Orchestrates the report processing workflow, including a pre-check
+    and correct window management for multi-table processing.
+    """
     
     def __init__(self, driver, wait, config: AppConfig):
         self.driver = driver
@@ -153,76 +159,223 @@ class ReportProcessor:
         self.config = config
         self.utils = PageUtils(driver, wait)
         self.banner_handler = BannerFrameHandler(driver, wait)
-        self.form_filler = ReportFormFiller(driver, wait, self.utils, config)
-        self.transaction_handler = TransactionInputHandler(driver, wait)
         self.commit_handler = CommitHandler(driver, wait)
-        
-    # ! FUNC WITHOUT CLICK COMMIT BUTTON
-    def process(self) -> Dict[str, bool]:
-        """Execute report processing without commit."""
-        Logger.info("Starting Report Mode Processing")
-        results = {}
+        self.validator = ExtractorValidator(driver, wait, self.banner_handler)
+        self.form_filler = ReportFormFiller(driver, wait, self.utils, config)
+        self.unidentified_log_path = os.path.join(config.inspect_dir, "extractor_unidentify.txt")
 
+        # Clear the log file at the start of the process
+        with open(self.unidentified_log_path, "w") as f:
+            f.write("--- Unidentified Extractor Fields Log ---\n")
+
+    def _log_unidentified_extractors(self, table_name: str, invalid_extractors: List[str]):
+        """Appends a list of unidentified extractors for a table to the log file."""
+        if not invalid_extractors:
+            return
+        
+        with open(self.unidentified_log_path, "a") as f:
+            f.write(f"\nTable: {table_name}\n")
+            f.write("  Fields not found in STANDARD.SELECTION:\n")
+            for extractor in invalid_extractors:
+                f.write(f"  - {extractor}\n")
+        Logger.warning(f"{len(invalid_extractors)} fields for '{table_name}' were not found. See log for details.")
+
+    # ! FUNC WITHOUT CLICK COMMIT BUTTON
+    # def process(self) -> Dict[str, bool]:
+    #     """
+    #     Executes report processing with pre-validation but without committing.
+    #     Stops after filling the form for the first table for inspection.
+    #     """
+    #     Logger.info("Starting Report Mode (NO COMMIT / TEST RUN)")
+    #     results = {}
+        
+    #     if not self.config.tables:
+    #         Logger.warning("No tables configured for Report Mode.")
+    #         return {}
+        
+    #     table_name = self.config.tables[0]
+    #     self.form_filler.reset_extractor_cache()
+        
+    #     # --- VALIDATION STEP ---
+    #     required_extractors = self.config.extractors.get(table_name, [])
+    #     if not required_extractors:
+    #         valid_extractors = []
+    #     else:
+    #         valid_extractors, invalid_extractors = self.validator.validate_extractors_for_table(table_name, required_extractors)
+    #         self._log_unidentified_extractors(table_name, invalid_extractors)
+
+    #     if required_extractors and not valid_extractors:
+    #         Logger.error(f"All required fields for '{table_name}' are invalid. Skipping form filling.")
+    #         results[table_name] = False
+    #         return results
+
+    #     # --- FORM FILLING STEP ---
+    #     Logger.plain("-" * 50)
+    #     Logger.info(f"Proceeding to fill EXT.REPORT form for '{table_name}'.")
+        
+    #     command = f"EXT.REPORT,INP {table_name}"
+    #     if not self.banner_handler.execute_command(command):
+    #         results[table_name] = False
+    #         return results
+        
+    #     if not self.form_filler.fill_mandatory_fields(table_name):
+    #         results[table_name] = False
+    #         return results
+        
+    #     if valid_extractors and not self.form_filler.fill_dynamic_fields(valid_extractors):
+    #         results[table_name] = False
+    #         return results
+        
+    #     results[table_name] = True
+    #     Logger.success(f"Table '{table_name}' form filled successfully (simulation).")
+    #     Logger.info("Process stopped for inspection. No commit will be performed.")
+    #     return results
+
+    # ! FUNC WITH CLICK COMMIT BUTTON
+    def process(self) -> Dict[str, bool]:
+        """Execute report processing with commit and pre-validation for multiple tables."""
+        Logger.info("Starting Report Mode Processing (Commit Enabled)")
+        results = {}
+        
+        main_window_handle = self.driver.current_window_handle
+        
         for i, table_name in enumerate(self.config.tables):
             self.form_filler.reset_extractor_cache()
-
-            if i == 0:
-                command = f"EXT.REPORT,INP {table_name}"
-                if not self.banner_handler.execute_command(command):
-                    results[table_name] = False
-                    continue
-                
-            extractor_fields = self.config.extractors.get(table_name, [])
+            
+            # Ensure the driver context is on the main window before starting a new validation cycle.
+            self.driver.switch_to.window(main_window_handle)
+            
+            # --- VALIDATION STEP ---
+            required_extractors = self.config.extractors.get(table_name, [])
+            if not required_extractors:
+                valid_extractors = []
+            else:
+                valid_extractors, invalid_extractors = self.validator.validate_extractors_for_table(table_name, required_extractors)
+                self._log_unidentified_extractors(table_name, invalid_extractors)
+            
+            if required_extractors and not valid_extractors:
+                Logger.error(f"All required fields for '{table_name}' are invalid. Skipping.")
+                results[table_name] = False
+                continue
+            
+            # --- FORM FILLING STEP ---
+            Logger.plain("-" * 50)
+            Logger.info(f"Proceeding to fill EXT.REPORT form for '{table_name}'.")
+            
+            # Execute command from the main window. This opens a new window/tab.
+            command = f"EXT.REPORT,INP {table_name}"
+            if not self.banner_handler.execute_command(command):
+                results[table_name] = False
+                continue
+            
+            # The driver is now in the new EXT.REPORT window/tab.
+            
             if not self.form_filler.fill_mandatory_fields(table_name):
                 results[table_name] = False
                 continue
-
-            if extractor_fields and not self.form_filler.fill_dynamic_fields(extractor_fields):
+            
+            if valid_extractors and not self.form_filler.fill_dynamic_fields(valid_extractors):
                 results[table_name] = False
                 continue
             
-            Logger.info("[SKIP] Commit button skipped during testing")
-                
+            if not self.commit_handler.execute_commit():
+                results[table_name] = False
+                continue
+
             results[table_name] = True
-            Logger.success(f"Table {table_name} processed")
+            Logger.success(f"Successfully processed and committed table: {table_name}\n")
             
-            Logger.plain("Process will stop after this table because commit is skipped.")
-            break 
+            # --- WINDOW MANAGEMENT FOR NEXT LOOP ---
+            # After processing, close the current form window to return to the main one.
+            if i < len(self.config.tables) - 1:
+                Logger.info("Closing current form window to prepare for the next table.")
+                if self.driver.current_window_handle != main_window_handle:
+                    self.driver.close()
+                self.driver.switch_to.window(main_window_handle)
+            else:
+                Logger.info("Last table processed. Finishing.")
         return results
+
+# ! OLD CLASS
+# class ReportProcessor:
+#     """Orchestrates the report generation workflow."""
     
-    # ! FUNC WITH CLICK COMMIT BUTTON
-    # def process(self) -> Dict[str, bool]:
-    #     """Execute report processing with commit."""
-    #     Logger.info("Starting Report Mode Processing")
-    #     results = {}
-    #     for i, table_name in enumerate(self.config.tables):
-    #         self.form_filler.reset_extractor_cache()
-    #         if i == 0:
-    #             command = f"EXT.REPORT,INP {table_name}"
-    #             if not self.banner_handler.execute_command(command):
-    #                 results[table_name] = False
-    #                 continue
-    #         extractor_fields = self.config.extractors.get(table_name, [])
+#     def __init__(self, driver, wait, config: AppConfig):
+#         self.driver = driver
+#         self.wait = wait
+#         self.config = config
+#         self.utils = PageUtils(driver, wait)
+#         self.banner_handler = BannerFrameHandler(driver, wait)
+#         self.form_filler = ReportFormFiller(driver, wait, self.utils, config)
+#         self.transaction_handler = TransactionInputHandler(driver, wait)
+#         self.commit_handler = CommitHandler(driver, wait)
+        
+#     # ! FUNC WITHOUT CLICK COMMIT BUTTON
+#     # def process(self) -> Dict[str, bool]:
+#     #     """Execute report processing without commit."""
+#     #     Logger.info("Starting Report Mode Processing")
+#     #     results = {}
+
+#     #     for i, table_name in enumerate(self.config.tables):
+#     #         self.form_filler.reset_extractor_cache()
+
+#     #         if i == 0:
+#     #             command = f"EXT.REPORT,INP {table_name}"
+#     #             if not self.banner_handler.execute_command(command):
+#     #                 results[table_name] = False
+#     #                 continue
+                
+#     #         extractor_fields = self.config.extractors.get(table_name, [])
+#     #         if not self.form_filler.fill_mandatory_fields(table_name):
+#     #             results[table_name] = False
+#     #             continue
+
+#     #         if extractor_fields and not self.form_filler.fill_dynamic_fields(extractor_fields):
+#     #             results[table_name] = False
+#     #             continue
             
-    #         if not self.form_filler.fill_mandatory_fields(table_name):
-    #             results[table_name] = False
-    #             continue
+#     #         Logger.info("[SKIP] Commit button skipped during testing")
+                
+#     #         results[table_name] = True
+#     #         Logger.success(f"Table {table_name} processed")
             
-    #         if extractor_fields and not self.form_filler.fill_dynamic_fields(extractor_fields):
-    #             results[table_name] = False
-    #             continue
+#     #         Logger.plain("Process will stop after this table because commit is skipped.")
+#     #         break 
+#     #     return results
+    
+#     # ! FUNC WITH CLICK COMMIT BUTTON
+#     def process(self) -> Dict[str, bool]:
+#         """Execute report processing with commit."""
+#         Logger.info("Starting Report Mode Processing")
+#         results = {}
+#         for i, table_name in enumerate(self.config.tables):
+#             self.form_filler.reset_extractor_cache()
+#             if i == 0:
+#                 command = f"EXT.REPORT,INP {table_name}"
+#                 if not self.banner_handler.execute_command(command):
+#                     results[table_name] = False
+#                     continue
+#             extractor_fields = self.config.extractors.get(table_name, [])
             
-    #         if not self.commit_handler.execute_commit():
-    #             results[table_name] = False
-    #             continue
+#             if not self.form_filler.fill_mandatory_fields(table_name):
+#                 results[table_name] = False
+#                 continue
             
-    #         results[table_name] = True
-    #         Logger.success(f"Processed table: {table_name}\n")
-    #         if i < len(self.config.tables) - 1:
-    #             next_table = self.config.tables[i + 1]
-    #             if not self.transaction_handler.input_transaction(next_table):
-    #                 break    
-    #     return results
+#             if extractor_fields and not self.form_filler.fill_dynamic_fields(extractor_fields):
+#                 results[table_name] = False
+#                 continue
+            
+#             if not self.commit_handler.execute_commit():
+#                 results[table_name] = False
+#                 continue
+            
+#             results[table_name] = True
+#             Logger.success(f"Processed table: {table_name}\n")
+#             if i < len(self.config.tables) - 1:
+#                 next_table = self.config.tables[i + 1]
+#                 if not self.transaction_handler.input_transaction(next_table):
+#                     break    
+#         return results
 
 class DfeParamProcessor:
     """Orchestrates the DFE.PARAMETER processing workflow."""
@@ -299,8 +452,13 @@ class DfeParamProcessor:
                     break      
         return results
 
+# ! NEW CLASS
 class DfeMappingProcessor:
-    """Orchestrates the DFE.MAPPING workflow using a high-performance filler."""
+    """
+    Orchestrates the DFE.MAPPING workflow, including a pre-check
+    to validate mapping fields against STANDARD.SELECTION and to halt
+    if no valid extractor fields are found.
+    """
     
     def __init__(self, driver, wait, config: AppConfig):
         self.driver = driver
@@ -308,10 +466,28 @@ class DfeMappingProcessor:
         self.config = config
         self.utils = PageUtils(driver, wait)
         self.banner_handler = BannerFrameHandler(driver, wait)
-        self.form_filler = DfeMappingFormFiller(driver, wait, self.utils, config)
-        self.transaction_handler = TransactionInputHandler(driver, wait)
         self.commit_handler = CommitHandler(driver, wait)
+        # Initialize the validator and the form filler
+        self.validator = ExtractorValidator(driver, wait, self.banner_handler)
+        self.form_filler = DfeMappingFormFiller(driver, wait, self.utils, config)
+        self.unidentified_log_path = os.path.join(config.inspect_dir, "extractor_unidentify.txt")
 
+        # Clear the log file at the start of the process
+        with open(self.unidentified_log_path, "w") as f:
+            f.write("--- Unidentified Extractor Fields Log ---\n")
+
+    def _log_unidentified_extractors(self, table_name: str, invalid_extractors: List[str]):
+        """Appends a list of unidentified extractors for a table to the log file."""
+        if not invalid_extractors:
+            return
+        
+        with open(self.unidentified_log_path, "a") as f:
+            f.write(f"\nTable: {table_name}\n")
+            f.write("  Fields not found in STANDARD.SELECTION:\n")
+            for extractor in invalid_extractors:
+                f.write(f"  - {extractor}\n")
+        Logger.warning(f"{len(invalid_extractors)} fields for '{table_name}' were not found. See log for details.")
+    
     def _switch_to_main_frame(self) -> bool:
         """Helper to reliably switch to the main form frame using a landmark element."""
         if not self.utils.find_and_switch_to_frame_containing(By.NAME, "fieldName:FILE.NAME"):
@@ -323,17 +499,36 @@ class DfeMappingProcessor:
     # ! FUNC WITHOUT CLICK COMMIT BUTTON
     def process(self) -> Dict[str, bool]:
         """
-        Executes a test run for DFE Mapping on the first table without committing.
-        Utilizes the batched method for a fast and accurate test.
+        Executes a test run for DFE Mapping with pre-validation but no commit.
         """
         Logger.info("Starting DFE Mapping Mode (NO COMMIT / TEST RUN)")
         results = {}
+        
         if not self.config.tables:
             Logger.warning("No tables configured for DFE Mapping.")
             return {}
-
+        
         table_name = self.config.tables[0]
         self.form_filler.reset_cache()
+        
+        required_extractors = self.config.extractors.get(table_name, [])
+        if not required_extractors:
+            Logger.warning(f"No extractors listed for table '{table_name}'. Assuming only mandatory fields needed.")
+            valid_extractors = []
+        else:
+            valid_extractors, invalid_extractors = self.validator.validate_extractors_for_table(table_name, required_extractors)
+            self._log_unidentified_extractors(table_name, invalid_extractors)
+
+        if required_extractors and not valid_extractors:
+            Logger.error(f"All {len(required_extractors)} required fields for '{table_name}' are invalid. Skipping form filling for this table.")
+            results[table_name] = False
+            return results
+
+        Logger.plain("-" * 50)
+        if valid_extractors:
+            Logger.info(f"Proceeding to fill DFE.MAPPING form for '{table_name}' with {len(valid_extractors)} valid fields.")
+        else:
+            Logger.info(f"Proceeding to fill DFE.MAPPING form for '{table_name}' with mandatory fields only.")
         
         command = f"DFE.MAPPING, {table_name}"
         if not self.banner_handler.execute_command(command):
@@ -344,62 +539,184 @@ class DfeMappingProcessor:
             results[table_name] = False
             return results
 
-        is_successful = True
         if not self.form_filler.fill_mandatory_fields(table_name):
-            is_successful = False
-
-        extractor_fields = self.config.extractors.get(table_name, [])
-        if is_successful and extractor_fields:
-            if not self.form_filler.fill_dynamic_fields_batched(extractor_fields):
-                is_successful = False
+            results[table_name] = False
+            return results
         
-        results[table_name] = is_successful
-        if is_successful:
-            Logger.info("[SKIP] Commit button skipped during test run.")
-            Logger.success(f"Table '{table_name}' processed successfully (simulation).")
-        else:
-            Logger.error(f"Processing failed for table '{table_name}'.")
+        if valid_extractors:
+            if not self.form_filler.fill_dynamic_fields_batched(valid_extractors):
+                results[table_name] = False
+                return results
+        
+        results[table_name] = True
+        Logger.success(f"Table '{table_name}' form filled successfully (simulation).")
+        Logger.info("Process stopped for inspection. No commit will be performed.")
         return results
-    
+
     # ! FUNC WITH CLICK COMMIT BUTTON
     # def process(self) -> Dict[str, bool]:
-    #     """
-    #     Execute DFE Mapping processing with commit, utilizing the batched
-    #     method for optimal performance on all browsers.
-    #     """
+    #     """Execute DFE Mapping processing with commit and pre-validation."""
     #     Logger.info("Starting DFE Map Mode Processing (Commit Enabled)")
     #     results = {}
     #     total_tables = len(self.config.tables)
+
     #     for i, table_name in enumerate(self.config.tables):
     #         self.form_filler.reset_cache()
+            
+    #         # --- VALIDATION STEP ---
+    #         required_extractors = self.config.extractors.get(table_name, [])
+    #         if not required_extractors:
+    #             Logger.warning(f"No fields listed for table '{table_name}'. Proceeding with mandatory fields only.")
+    #             valid_extractors = []
+    #         else:
+    #             valid_extractors, invalid_extractors = self.validator.validate_extractors_for_table(table_name, required_extractors)
+    #             self._log_unidentified_extractors(table_name, invalid_extractors)
+
+    #         # --- HALT IF NO VALID FIELDS ---
+    #         if required_extractors and not valid_extractors:
+    #             Logger.error(f"All {len(required_extractors)} required fields for '{table_name}' are invalid. Skipping processing for this table.")
+    #             results[table_name] = False
+    #             continue # Lanjut ke tabel berikutnya
+
+    #         # --- FORM FILLING STEP ---
     #         Logger.plain("-" * 50)
-    #         Logger.info(f"Processing table {i+1}/{total_tables}: {table_name}")
-    #         if i == 0:
-    #             command = f"DFE.MAPPING, {table_name}"
-    #             if not self.banner_handler.execute_command(command):
-    #                 results[table_name] = False
-    #                 Logger.error(f"Initial command failed for {table_name}. Aborting process.")
-    #                 break
+    #         if valid_extractors:
+    #             Logger.info(f"Proceeding to fill DFE.MAPPING form for '{table_name}' with {len(valid_extractors)} valid fields.")
+    #         else:
+    #             Logger.info(f"Proceeding to fill DFE.MAPPING form for '{table_name}' with mandatory fields only.")
+            
+    #         command = f"DFE.MAPPING, {table_name}"
+    #         if not self.banner_handler.execute_command(command):
+    #             results[table_name] = False
+    #             continue
+
     #         if not self._switch_to_main_frame():
     #             results[table_name] = False
-    #             Logger.error(f"Failed to find form frame for {table_name}. Aborting.")
-    #             break
-    #         extractor_fields = self.config.extractors.get(table_name, [])
+    #             continue
+            
     #         if not self.form_filler.fill_mandatory_fields(table_name):
     #             results[table_name] = False
     #             continue
-    #         if extractor_fields and not self.form_filler.fill_dynamic_fields_batched(extractor_fields):
-    #             results[table_name] = False
-    #             continue
+            
+    #         if valid_extractors:
+    #             if not self.form_filler.fill_dynamic_fields_batched(valid_extractors):
+    #                 results[table_name] = False
+    #                 continue
+            
     #         if not self.commit_handler.execute_commit():
     #             results[table_name] = False
-    #             Logger.error(f"Commit failed for {table_name}. Aborting process.")
-    #             break
+    #             continue
+
     #         results[table_name] = True
-    #         Logger.success(f"Successfully processed table: {table_name}\n")
-    #         if i < len(self.config.tables) - 1:
-    #             next_table = self.config.tables[i + 1]
-    #             if not self.transaction_handler.input_transaction(next_table):
-    #                 Logger.error(f"Failed to load next table: {next_table}. Aborting.")
-    #                 break
+    #         Logger.success(f"Successfully processed and committed table: {table_name}\n")
+
+    #         # Berhenti setelah satu tabel untuk mode DFE Mapping
+    #         Logger.info("DFE Mapping processing for one table complete. Stopping as designed.")
+    #         break
     #     return results
+
+# ! OLD CLASS
+# class DfeMappingProcessor:
+#     """Orchestrates the DFE.MAPPING workflow using a high-performance filler."""
+    
+#     def __init__(self, driver, wait, config: AppConfig):
+#         self.driver = driver
+#         self.wait = wait
+#         self.config = config
+#         self.utils = PageUtils(driver, wait)
+#         self.banner_handler = BannerFrameHandler(driver, wait)
+#         self.form_filler = DfeMappingFormFiller(driver, wait, self.utils, config)
+#         self.transaction_handler = TransactionInputHandler(driver, wait)
+#         self.commit_handler = CommitHandler(driver, wait)
+
+#     def _switch_to_main_frame(self) -> bool:
+#         """Helper to reliably switch to the main form frame using a landmark element."""
+#         if not self.utils.find_and_switch_to_frame_containing(By.NAME, "fieldName:FILE.NAME"):
+#             Logger.error("Could not switch to the main form frame.")
+#             return False
+#         Logger.debug("Successfully switched to the main form frame.")
+#         return True
+
+#     # ! FUNC WITHOUT CLICK COMMIT BUTTON
+#     def process(self) -> Dict[str, bool]:
+#         """
+#         Executes a test run for DFE Mapping on the first table without committing.
+#         Utilizes the batched method for a fast and accurate test.
+#         """
+#         Logger.info("Starting DFE Mapping Mode (NO COMMIT / TEST RUN)")
+#         results = {}
+#         if not self.config.tables:
+#             Logger.warning("No tables configured for DFE Mapping.")
+#             return {}
+
+#         table_name = self.config.tables[0]
+#         self.form_filler.reset_cache()
+        
+#         command = f"DFE.MAPPING, {table_name}"
+#         if not self.banner_handler.execute_command(command):
+#             results[table_name] = False
+#             return results
+
+#         if not self._switch_to_main_frame():
+#             results[table_name] = False
+#             return results
+
+#         is_successful = True
+#         if not self.form_filler.fill_mandatory_fields(table_name):
+#             is_successful = False
+
+#         extractor_fields = self.config.extractors.get(table_name, [])
+#         if is_successful and extractor_fields:
+#             if not self.form_filler.fill_dynamic_fields_batched(extractor_fields):
+#                 is_successful = False
+        
+#         results[table_name] = is_successful
+#         if is_successful:
+#             Logger.info("[SKIP] Commit button skipped during test run.")
+#             Logger.success(f"Table '{table_name}' processed successfully (simulation).")
+#         else:
+#             Logger.error(f"Processing failed for table '{table_name}'.")
+#         return results
+    
+#     # ! FUNC WITH CLICK COMMIT BUTTON
+#     # def process(self) -> Dict[str, bool]:
+#     #     """
+#     #     Execute DFE Mapping processing with commit, utilizing the batched
+#     #     method for optimal performance on all browsers.
+#     #     """
+#     #     Logger.info("Starting DFE Map Mode Processing (Commit Enabled)")
+#     #     results = {}
+#     #     total_tables = len(self.config.tables)
+#     #     for i, table_name in enumerate(self.config.tables):
+#     #         self.form_filler.reset_cache()
+#     #         Logger.plain("-" * 50)
+#     #         Logger.info(f"Processing table {i+1}/{total_tables}: {table_name}")
+#     #         if i == 0:
+#     #             command = f"DFE.MAPPING, {table_name}"
+#     #             if not self.banner_handler.execute_command(command):
+#     #                 results[table_name] = False
+#     #                 Logger.error(f"Initial command failed for {table_name}. Aborting process.")
+#     #                 break
+#     #         if not self._switch_to_main_frame():
+#     #             results[table_name] = False
+#     #             Logger.error(f"Failed to find form frame for {table_name}. Aborting.")
+#     #             break
+#     #         extractor_fields = self.config.extractors.get(table_name, [])
+#     #         if not self.form_filler.fill_mandatory_fields(table_name):
+#     #             results[table_name] = False
+#     #             continue
+#     #         if extractor_fields and not self.form_filler.fill_dynamic_fields_batched(extractor_fields):
+#     #             results[table_name] = False
+#     #             continue
+#     #         if not self.commit_handler.execute_commit():
+#     #             results[table_name] = False
+#     #             Logger.error(f"Commit failed for {table_name}. Aborting process.")
+#     #             break
+#     #         results[table_name] = True
+#     #         Logger.success(f"Successfully processed table: {table_name}\n")
+#     #         if i < len(self.config.tables) - 1:
+#     #             next_table = self.config.tables[i + 1]
+#     #             if not self.transaction_handler.input_transaction(next_table):
+#     #                 Logger.error(f"Failed to load next table: {next_table}. Aborting.")
+#     #                 break
+#     #     return results
