@@ -1,6 +1,5 @@
 venv/
 screenshots/
-inspect/
 dev/
 batch_config.ini
 dfe_mapping_config.ini

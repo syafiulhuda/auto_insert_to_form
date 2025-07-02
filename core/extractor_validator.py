@@ -31,7 +31,7 @@ class ExtractorValidator:
             self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
         # =====================================================================
-        # === JavaScript dengan XPath Evaluator ===
+        # === JS XPath ===
         # =====================================================================
         js_xpath_scanner = """
         const fields = new Set();
@@ -99,7 +99,8 @@ class ExtractorValidator:
         command = f"SS, S {clean_table_name}"
         
         Logger.plain("-" * 50)
-        Logger.info(f"Validating extractors for '{table_name}' using command: '{command}'")
+        # Logger.info(f"Validating extractors for '{table_name}' using command: '{command}'")
+        Logger.info(f"Validating extractors for '{table_name}'")
 
         main_window = self.driver.current_window_handle
         
