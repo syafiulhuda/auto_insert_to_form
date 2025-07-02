@@ -3,13 +3,12 @@ from typing import Dict, List, Tuple, Union
 
 class DataManager:
     """Handles data loading operations from external files."""
-    
+
     @staticmethod
-    def load_batch_tables(file_path: str) -> List[str]:
+    def load_batch_commands_and_tables(file_path: str) -> List[Tuple[str, List[str]]]:
         """
-        Loads batch commands and their corresponding table lists from a file.
+        Loads a sequence of batch commands and their corresponding table lists from a file.
         The file format uses [Command] as a header for each section.
-        This version robustly handles file format variations.
         """
         batch_jobs = []
         current_command = None
@@ -19,28 +18,27 @@ class DataManager:
             with open(file_path, "r", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     stripped_line = line.strip()
-                    # Abaikan baris kosong atau baris komentar
+                    # Ignore empty lines or lines that are comments.
                     if not stripped_line or stripped_line.startswith(';'):
                         continue
 
-                    # Deteksi header command baru
+                    # Detect a new command section (e.g., [BATCH, ...])
                     if stripped_line.startswith("[") and stripped_line.endswith("]"):
-                        # Jika command sebelumnya sudah ada isinya, simpan dulu
+                        # If we were already processing a command, save it before starting a new one.
                         if current_command and current_tables:
                             batch_jobs.append((current_command, current_tables))
                         
-                        # Mulai command baru
-                        current_command = stripped_line[1:-1].strip()
+                        # Start the new command section.
+                        current_command = f"BATCH, {stripped_line[1:-1].strip()}"
                         current_tables = []
-                    # Jika bukan header, tambahkan sebagai tabel HANYA JIKA sudah ada command yang aktif
+                    # Add the line as a table only if a command section is active.
                     elif current_command is not None:
                         current_tables.append(stripped_line)
                     else:
-                        # Ini terjadi jika ada data tabel sebelum ada header [COMMAND] pertama yang aktif.
-                        # Kita akan mengabaikannya dengan pesan peringatan.
+                        # This occurs if there is table data before the first [COMMAND] header.
                         Logger.warning(f"Ignoring line {line_num} ('{stripped_line}') because it appears before any active [Command] header.")
         
-            # Jangan lupa simpan command terakhir setelah loop selesai
+            # Add the last processed command and its tables after the loop finishes.
             if current_command and current_tables:
                 batch_jobs.append((current_command, current_tables))
 
@@ -48,7 +46,7 @@ class DataManager:
             return batch_jobs
 
         except FileNotFoundError:
-            Logger.error(f"Batch source file not found: {file_path}")
+            Logger.error(f"batch source file not found: {file_path}")
             return []
         except Exception as e:
             Logger.error(f"Failed to load batch data: {e}")
@@ -56,7 +54,7 @@ class DataManager:
 
     @staticmethod
     def load_extractor_data(file_path: str) -> Tuple[List[str], Dict[str, List[str]]]:
-        """Load extractor configuration with table-to-field mapping from an INI-like format."""
+        """Loads extractor configuration (table-to-field mapping) from an INI-like format."""
         ordered_tables = []
         extractors_dict = {}
         current_table = None
@@ -88,7 +86,7 @@ class DataManager:
         
     @staticmethod
     def load_dfe_params_data(file_path: str) -> List[str]:
-        """Load DFE parameter data (a simple list of tables)."""
+        """Loads DFE parameter data (a simple list of tables)."""
         tables = []
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -107,7 +105,7 @@ class DataManager:
 
     @staticmethod
     def load_dfe_map_data(file_path: str) -> Tuple[List[str], Dict[str, List[str]]]:
-        """Load DFE mapping data, which follows an INI-like format."""
+        """Loads DFE mapping data, which follows an INI-like format."""
         ordered_tables = []
         extractors_dict = {}
         current_table = None

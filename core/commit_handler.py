@@ -16,7 +16,7 @@ class CommitHandler:
     def execute_commit(self) -> bool:
         """Execute form commit action."""
         try:
-            # Locate the commit button using multiple possible identifiers for robustness.
+            # Locate the commit button using multiple possible identifiers for robustness
             commit_button = self.wait.until(
                 EC.element_to_be_clickable((
                     By.XPATH,

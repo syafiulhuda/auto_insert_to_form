@@ -31,6 +31,8 @@ class ExtractorValidator:
             self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
         # =====================================================================
+        # === JavaScript dengan XPath Evaluator ===
+        # =====================================================================
         js_xpath_scanner = """
         const fields = new Set();
         
@@ -85,7 +87,7 @@ class ExtractorValidator:
         Navigates to the STANDARD.SELECTION page, validates extractors, and returns the result.
         """
 
-        # ! UPDATE THIS FOR PROD ENV
+        # ! EDIT IN PROD ENVI
         clean_table_name = table_name
         if clean_table_name.startswith("ST.") and clean_table_name.endswith(".TEST"):
             clean_table_name = clean_table_name[3:-5] 

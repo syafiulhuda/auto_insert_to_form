@@ -681,7 +681,7 @@ class BatchFormFiller_JAMBI:
         Logger.info(f"Found {len(existing_tables)} existing JAMBI tables on the form.")
         return existing_tables
 
-    def execute_filling_process(self) -> bool:
+    def execute_filling_process(self, tables_from_file: List[str]) -> bool:
         """Main batch form filling workflow for the JAMBI version."""
         try:
             Logger.info("Starting form filling process for version: JAMBI")
@@ -690,7 +690,7 @@ class BatchFormFiller_JAMBI:
                 Logger.error("Failed to set mandatory BATCH.ENVIRONMENT radio button.")
                 return False
 
-            tables_from_file = DataManager.load_batch_tables(self.batch_file_path)
+            # tables_from_file = DataManager.load_batch_tables(self.batch_file_path)
             if not tables_from_file:
                 Logger.warning("No tables to process from file.")
                 return True

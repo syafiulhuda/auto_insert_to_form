@@ -24,3 +24,7 @@ Panduan singkat untuk menyiapkan environment, source, dan konfigurasi untuk menj
     url = T24_url
     username = your_username
     password = your_password
+
+5. **Unidentify Extractor:**
+    - Extractor unmatched vs STANDARD.SELECTION disimpan di:
+        - inspect/extractor_unidentify.txt

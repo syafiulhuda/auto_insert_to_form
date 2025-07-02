@@ -15,12 +15,17 @@ class AppConfig:
     headless: bool
     browser_choice: str = ""
     file_path: str = ""
-    # The specific version of the batch process to run (e.g., "sbii", "jamkrindo").
     batch_jobs: List[Tuple[str, List[str]]] = field(default_factory=list)
     batch_version: Optional[str] = None
-    # Holds data for dynamic form fields, mapping table names to field lists.
     extractors: Dict[str, List[str]] = field(default_factory=dict)
     tables: List[str] = field(default_factory=list)
+
+    # --- PIPELINE MODE ---
+    # Attributes to hold sub-configurations
+    param_config: Optional['AppConfig'] = None
+    mapping_config: Optional['AppConfig'] = None
+    batch_config: Optional['AppConfig'] = None
+    commit_enabled: bool = False
 
     @classmethod
     def from_config_file(cls, config_path: str, mode: str):

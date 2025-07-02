@@ -61,7 +61,7 @@ class WebDriverManager:
             
             service = FirefoxService(log_path=os.devnull)
             self.driver = webdriver.Firefox(service=service, options=options)
-            Logger.info("Firefox initialized to open new windows in tabs.")
+            # Logger.info("Firefox initialized to open new windows in tabs.")
         
         # --- Chrome (Default) Configuration ---
         else:
@@ -87,7 +87,7 @@ class WebDriverManager:
             
             self.driver.set_window_size(browser_width, browser_height)
             self.driver.set_window_position(0, 0)
-            Logger.debug(f"Browser resized to {browser_width}x{browser_height}")
+            # Logger.debug(f"Browser resized to {browser_width}x{browser_height}")
 
         # Navigate to the target URL.
         self.driver.get(self.config.url)
